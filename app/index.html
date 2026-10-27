@@ -1,0 +1,81 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Gatherlane</title>
+<meta name="description" content="An isometric agent office: status, inbox and levers for every agent fleet.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e9739a'/%3E%3Cpath d='M8 22V13l8-5 8 5v9z' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <div class="logo"><i></i><span>Gatherlane</span><small>agent office</small></div>
+  <nav class="chips" id="chips" aria-label="Floors"></nav>
+  <div class="sp"></div>
+  <button class="pill src" id="srcPill" title="Data source"></button>
+  <button class="btn" id="focusBtn" aria-pressed="false">Focus <kbd>F</kbd></button>
+  <div class="snd-wrap">
+    <button class="btn" id="soundBtn" aria-haspopup="true">🔇 <span>Sound</span></button>
+    <div class="pop" id="soundPop" hidden>
+      <label><input type="checkbox" id="musicT"> Lo-fi music</label>
+      <label><input type="checkbox" id="ambT"> Office sounds</label>
+      <label class="vol">Volume <input type="range" id="volR" min="0" max="1" step=".05" value=".5"></label>
+      <small>Off by default. Nothing plays until you tick a box.</small>
+    </div>
+  </div>
+  <button class="btn primary" id="inboxBtn">Inbox <span class="n" id="inboxN">0</span> <kbd>I</kbd></button>
+  <div class="clock" id="clock"></div>
+  <button class="btn icon" id="settingsBtn" title="Settings and connections" aria-label="Settings">⚙</button>
+</header>
+
+<main class="wrap">
+  <section class="stage" id="stage" aria-label="Office view">
+    <div class="sky" id="sky"></div><div class="sun" id="sun"></div>
+    <div class="viewport" id="viewport"></div>
+    <div class="crumbs" id="crumbs"></div>
+    <div class="cards" id="cards"></div>
+    <div class="legend" id="legend" hidden></div>
+    <div class="ctrl" id="ctrl"></div>
+    <div class="hint" id="hint" hidden></div>
+  </section>
+  <aside class="side" id="side" aria-label="Inbox"></aside>
+</main>
+
+<nav class="tabs-m" id="tabsM">
+  <button data-tab="inbox">Inbox <span id="inboxNm">0</span></button>
+  <button data-tab="floor">Floor</button>
+</nav>
+
+<div class="modal" id="settings" hidden>
+  <div class="sheet">
+    <h2>Settings &amp; connections</h2>
+    <p class="muted">Gatherlane only reads. Tokens stay in this browser and go only to api.github.com.</p>
+    <h3>Read-only tokens (one per GitHub owner)</h3>
+    <p class="muted small">Fine-grained tokens are scoped to one owner, so add one for each owner listed below. Permissions: Contents, Issues, Pull requests, Actions, Metadata — all <b>read-only</b>.</p>
+    <div id="tokRows"></div>
+    <label class="row"><input type="checkbox" id="remember"> Remember tokens on this device (otherwise they are forgotten when the tab closes)</label>
+    <h3>Optional: run workflows from here</h3>
+    <p class="muted small">Leave empty and “Run workflow” opens GitHub's dispatch page instead. A token here needs <b>Actions: read and write</b> on the agent repos and is used only when you press “Run now” and confirm.</p>
+    <div id="dispRows"></div>
+    <h3>Data</h3>
+    <label class="row"><input type="checkbox" id="useSample"> Show SAMPLE data instead of live data</label>
+    <div id="conn"></div>
+    <div class="actions"><button class="btn" id="setClose">Close</button><button class="btn primary" id="setSave">Save and refresh</button></div>
+  </div>
+</div>
+<div class="modal" id="confirm" hidden><div class="sheet small-sheet"><h3 id="cfT"></h3><p id="cfB" class="muted"></p><div class="actions"><button class="btn" id="cfNo">Cancel</button><button class="btn primary" id="cfYes">Run now</button></div></div></div>
+<div class="toast" id="toast" hidden></div>
+
+<!-- instance/ holds this office's own fleet: config, building and sample data. The rest is the engine. -->
+<script src="instance/config.js"></script>
+<script src="js/render.js"></script>
+<script src="instance/building.js"></script>
+<script src="instance/sample.js"></script>
+<script src="js/office.js"></script>
+<script src="js/data.js"></script>
+<script src="js/audio.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

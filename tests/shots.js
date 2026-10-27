@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: Apache-2.0
+// Visual smoke test: node tests/shots.js <outdir>. Prints the page errors it saw; [] means none.
+const { chromium } = require('playwright');
+const { appUrl, readInstance } = require('./app-under-test');
+(async () => {
+  const b = await chromium.launch();
+  const url = appUrl();
+  const out = process.argv[2] || '/tmp/gl';
+  require('fs').mkdirSync(out, { recursive: true });
+  const errs = [];
+  const p = await b.newPage({ viewport: { width: 1600, height: 950 } });
+  p.on('pageerror', e => errs.push('pageerror ' + e.message));
+  p.on('console', m => m.type() === 'error' && errs.push(m.text()));
+  await p.goto(url); await p.waitForTimeout(600);
+  const inst = await readInstance(p);
+  await p.screenshot({ path: out + '/1-building.png' });
+  await p.mouse.move(600, 500); await p.mouse.wheel(0, 900); await p.waitForTimeout(200);
+  await p.screenshot({ path: out + '/2-building-scrolled.png' });
+  await p.keyboard.press(inst.first.key); await p.waitForTimeout(300);
+  await p.screenshot({ path: out + `/3-floor-${inst.first.id}.png` });
+  const box = await p.locator(`[data-agent="${inst.agent}"] .bob`).boundingBox();
+  await p.mouse.click(box.x + box.width / 2, box.y + box.height / 2); await p.waitForTimeout(200);
+  await p.screenshot({ path: out + '/4-agent-card.png' });
+  await p.keyboard.press('Escape');
+  const rb = await p.locator(`[data-room="${inst.first.room}"]`).first().boundingBox();
+  await p.mouse.click(rb.x + rb.width * .3, rb.y + rb.height * .6); await p.waitForTimeout(200);
+  for (let i = 0; i < 6; i++) await p.keyboard.press('ArrowUp');
+  await p.screenshot({ path: out + '/5-room-walk.png' });
+  await p.keyboard.press('Escape'); await p.keyboard.press('r'); await p.waitForTimeout(200);
+  await p.screenshot({ path: out + '/6-rotated.png' });
+  await p.keyboard.press(inst.second.key); await p.keyboard.press('f'); await p.waitForTimeout(200);
+  await p.screenshot({ path: out + `/7-${inst.second.id}-focus.png` });
+  await p.keyboard.press('f'); await p.keyboard.press('r'); await p.keyboard.press('r'); await p.keyboard.press('r');
+  await p.keyboard.press('Escape'); await p.keyboard.press('Escape'); await p.waitForTimeout(200);
+  await p.screenshot({ path: out + '/8-back-building.png' });
+  const m = await b.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+  m.on('pageerror', e => errs.push('m pageerror ' + e.message));
+  await m.goto(url); await m.waitForTimeout(500);
+  await m.screenshot({ path: out + '/9-mobile-floor.png' });
+  await m.tap('#tabsM [data-tab=inbox]'); await m.waitForTimeout(200);
+  await m.screenshot({ path: out + '/10-mobile-inbox.png' });
+  console.log(JSON.stringify(errs, null, 1));
+  await b.close();
+  process.exit(errs.length ? 1 : 0);
+})();

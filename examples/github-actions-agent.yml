@@ -1,0 +1,37 @@
+# Example: a scheduled agent in GitHub Actions that reports to Gatherlane.
+# Copy into the agent's repo as .github/workflows/<agent>.yml and change the four marked lines.
+# Needs the repo (or org) secret GATHERLANE_TOKEN: fine-grained token, owner of your
+# Gatherlane repo, repo gatherlane, Contents: read and write.
+name: support-agent                              # <- 1. workflow name
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"                       # <- 2. UTC in GitHub; the --cron below is read in GATHERLANE_TZ
+  workflow_dispatch: {}                          # lets Gatherlane's "Run workflow" button work
+
+concurrency: { group: support-agent, cancel-in-progress: false }
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GATHERLANE_TOKEN: ${{ secrets.GATHERLANE_TOKEN }}
+      GATHERLANE_REPO: <owner>/gatherlane         # where status lives
+      GATHERLANE_TZ: UTC                          # zone the --cron below is read in
+      AGENT: myops/support-agent                 # <- 3. agent id, as in app/instance/config.js
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the Gatherlane reporter
+        run: |
+          curl -fsSL -H "Authorization: Bearer $GATHERLANE_TOKEN" -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${GATHERLANE_REPO}/contents/tools/gatherlane.py?ref=main" -o /tmp/gatherlane.py
+      - name: Run the agent (honours the pause flag, reports running → result)
+        run: |
+          python3 /tmp/gatherlane.py run --agent "$AGENT" --cron "*/15 * * * *" \
+            --runbook "https://github.com/${{ github.repository }}/blob/main/agents/support-agent.md" \
+            --workflow "https://github.com/${{ github.repository }}/actions/workflows/support-agent.yml" \
+            -- ./scripts/run-support-agent.sh     # <- 4. the real agent command
+        # The agent asks for a human by writing JSON to "$GATHERLANE_OUT", for example:
+        #   echo '{"needs_human_kind":"escalation","reason":"Refund outside policy","issue":"https://github.com/..."}' > "$GATHERLANE_OUT"
+        # Keep the reason to one line and free of customer names or phone numbers.

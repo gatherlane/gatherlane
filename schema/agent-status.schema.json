@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gatherlane.agent-status/v1",
+  "title": "Gatherlane agent status (status/<operation>/<agent>.json on the status branch)",
+  "description": "Written by tools/gatherlane.py (or anything that follows this contract). The office only reads it. A missing file shows as 'no data', never a guessed state.",
+  "type": "object",
+  "required": [
+    "schema",
+    "agent",
+    "operation",
+    "status",
+    "updated_at",
+    "needs_human"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "gatherlane.agent-status/v1"
+    },
+    "agent": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+(/[a-z0-9-]+)?$",
+      "description": "Stable id, <operation>/<agent> or a single name, e.g. acme/support-agent, orchestrator-1"
+    },
+    "operation": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$",
+      "description": "Operation (floor) key from app/instance/config.js, e.g. acme or shared"
+    },
+    "pod": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Room id on the floor, e.g. support, product"
+    },
+    "status": {
+      "enum": [
+        "idle",
+        "running",
+        "waiting",
+        "blocked",
+        "failed",
+        "sleeping",
+        "not_deployed"
+      ],
+      "description": "waiting = waiting for a human. sleeping = deployed but outside its schedule. not_deployed = runbook exists, nothing runs it yet."
+    },
+    "current_task": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "additionalProperties": false
+    },
+    "last_run_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_result": {
+      "enum": [
+        "success",
+        "failure",
+        "cancelled",
+        "skipped",
+        null
+      ]
+    },
+    "last_result_url": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uri",
+      "description": "Workflow run, log or report produced by the last run"
+    },
+    "next_run_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "schedule": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "cron": {
+          "type": "string"
+        },
+        "tz": {
+          "type": "string",
+          "description": "IANA time zone the cron is read in (GATHERLANE_TZ), e.g. UTC or Asia/Jakarta"
+        }
+      },
+      "required": [
+        "cron"
+      ],
+      "additionalProperties": false
+    },
+    "needs_human": {
+      "type": "boolean"
+    },
+    "needs_human_kind": {
+      "enum": [
+        "escalation",
+        "approval",
+        "review",
+        "failed_run",
+        null
+      ]
+    },
+    "needs_human_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 200,
+      "description": "One line. No customer PII: say 'refund outside policy', not the seller's name or phone."
+    },
+    "links": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "runbook": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri"
+        },
+        "issue": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri"
+        },
+        "pr": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri"
+        },
+        "workflow": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri",
+          "description": "GitHub Actions workflow page; the office links to its 'Run workflow' dispatch page"
+        }
+      }
+    },
+    "stale_after_minutes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "description": "Optional override. Default: 2x the schedule interval, or 60 min for unscheduled agents."
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this file was written. Drives the 'stale' marker."
+    },
+    "reported_by": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "e.g. github-actions:acme/ops/support.yml#1234 or user@host"
+    }
+  }
+}

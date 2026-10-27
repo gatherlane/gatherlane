@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gatherlane.control/v1",
+  "title": "Pause flags (control/pause.json on the status branch)",
+  "type": "object",
+  "required": [
+    "paused"
+  ],
+  "properties": {
+    "schema": {
+      "const": "gatherlane.control/v1"
+    },
+    "paused": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "since": {
+            "type": "string"
+          },
+          "by": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

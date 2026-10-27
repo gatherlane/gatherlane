@@ -1,0 +1,14 @@
+{
+  "name": "gatherlane",
+  "private": true,
+  "description": "An isometric office for your agent fleets",
+  "scripts": {
+    "test": "npm run test:py && npm run test:browser && npm run test:example",
+    "test:py": "python3 -m unittest discover -s tests",
+    "test:browser": "node tests/shots.js out/shots && node tests/live-mock.js out/live",
+    "test:example": "GATHERLANE_INSTANCE=examples/instance node tests/shots.js out/example-shots && GATHERLANE_INSTANCE=examples/instance node tests/live-mock.js out/example-live"
+  },
+  "devDependencies": {
+    "playwright": "1.49.0"
+  }
+}
