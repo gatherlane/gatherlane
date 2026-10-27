@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Gatherlane configuration: where status lives, which repos to watch, and what each agent is.
-// This is the example fleet. Copy examples/instance/ to app/instance/ and edit it for your own;
-// the building layout lives in building.js.
+// This is the example fleet. Copy examples/instance/ to app/instance/ and edit it for your own.
+// The building is generated from this file; building.js can replace it with a hand-drawn one.
 (function (G) {
   const gh = r => `https://github.com/${r}`;
   const RB = r => `https://github.com/${r}/blob/main/.claude/agents/`;
@@ -25,27 +25,32 @@
       acme: {
         name: 'Product Studio', level: 'product',
         repos: ['acme/web', 'acme/api'],
+        rooms: [{ id: 'build', name: 'Build room' }, { id: 'support', name: 'Support desk' }, { id: 'triage', name: 'Triage' }],
         roomRepos: { build: ['acme/web', 'acme/api'], support: ['acme/web'] },
+        site: 'acme.example',
       },
-      growth: { name: 'Growth Floor', level: 'growth', repos: ['acme/docs'] },
+      growth: {
+        name: 'Growth Floor', level: 'growth', repos: ['acme/docs'],
+        rooms: [{ id: 'content', name: 'Content pod' }, { id: 'insights', name: 'Insights' }, { id: 'launch', name: 'Launch room' }],
+      },
       // agent ids starting with these prefixes report under this operation (keep in step with GATHERLANE_OPS)
-      shared: { name: 'Shared', level: 'den', repos: [], agentPrefixes: ['orchestrator'] },
+      shared: { name: 'Coordination Den', level: 'den', repos: [], agentPrefixes: ['orchestrator'], rooms: [{ id: 'den', name: 'Orchestrator den' }] },
     },
 
     // PR labels that put a pull request in the inbox
     inboxLabels: { 'review:approved': 'ready to merge', 'review:needs-maintainer': 'needs maintainer' },
 
     agents: {
-      'orchestrator-1': { role: 'Orchestrator session: runs implementer and reviewer cycles', runbook: null },
+      'orchestrator-1': { room: 'den', role: 'Orchestrator session: runs implementer and reviewer cycles', runbook: null },
 
-      'acme/implementer': { role: 'Implements one issue per pull request', runbook: RB('acme/web') + 'implementer.md', repo: 'acme/web' },
-      'acme/pr-reviewer': { role: 'Reviews each pull request and sets a review:* label', runbook: RB('acme/web') + 'pr-reviewer.md', repo: 'acme/web' },
-      'acme/support': { role: 'Answers customer email, escalates refunds', runbook: null },
-      'acme/triage': { role: 'Labels and routes new issues', runbook: null, repo: 'acme/api' },
+      'acme/implementer': { room: 'build', role: 'Implements one issue per pull request', runbook: RB('acme/web') + 'implementer.md', repo: 'acme/web' },
+      'acme/pr-reviewer': { room: 'build', role: 'Reviews each pull request and sets a review:* label', runbook: RB('acme/web') + 'pr-reviewer.md', repo: 'acme/web' },
+      'acme/support': { room: 'support', role: 'Answers customer email, escalates refunds', runbook: null },
+      'acme/triage': { room: 'triage', role: 'Labels and routes new issues', runbook: null, repo: 'acme/api' },
 
-      'growth/writer': { role: 'Drafts docs pages and release notes', runbook: null, repo: 'acme/docs' },
-      'growth/analytics': { role: 'Morning brief: sign-ups, retention, anomalies', runbook: null },
-      'growth/social': { role: 'Social posts from release notes', runbook: null, note: 'Not built yet' },
+      'growth/writer': { room: 'content', role: 'Drafts docs pages and release notes', runbook: null, repo: 'acme/docs' },
+      'growth/analytics': { room: 'insights', role: 'Morning brief: sign-ups, retention, anomalies', runbook: null },
+      'growth/social': { room: 'launch', role: 'Social posts from release notes', runbook: null, note: 'Not built yet' },
     },
   };
   G.GATHERLANE_CONFIG.gh = gh;

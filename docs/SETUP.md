@@ -98,8 +98,8 @@ Type the token in your own terminal; do not paste it into an agent session. The 
 this file itself for any `GATHERLANE_*` setting not already in the environment, so an agent session
 does not need to source it. `GATHERLANE_ENV` points it at a different file.
 
-**Agent ids.** An id is `<operation>/<agent>`, and the same id goes in `app/instance/config.js`,
-in `app/instance/building.js` and on the reporter's `--agent`. The id's first part is its operation, and the
+**Agent ids.** An id is `<operation>/<agent>`, and the same id goes in `app/instance/config.js`
+(and in `building.js` if you draw the building by hand) and on the reporter's `--agent`. The id's first part is its operation, and the
 file goes to `status/<operation>/<agent>.json`. An id without a slash, such as `orchestrator-1`,
 goes to `shared`. When several prefixes share one operation, list them in both places:
 `agentPrefixes` on the operation in `config.js`, and `GATHERLANE_OPS` for the reporter, for
@@ -182,11 +182,16 @@ cd /tmp/gl-status && python3 tools/gatherlane.py validate $(find control status 
 Everything below is in `app/instance/`. A new office starts as a copy of `examples/instance/`.
 
 - New repo to watch: add it to the operation's `repos` in `config.js`.
-- New agent: add a character in `building.js` (room, position, look) and its role and runbook
-  in `config.js`. Its id is what the reporter uses with `--agent`; register it once with
-  `report --status not_deployed --new`.
-- New operation: add it to `operations` in `config.js` and a floor in `building.js`.
-  If its agents use more than one id prefix, list them in `agentPrefixes` and in `GATHERLANE_OPS`.
+- New agent: add it to `agents` in `config.js` with its role and runbook, and optionally a
+  `room`, a `name` and a `look`. Its id is what the reporter uses with `--agent`; register it once
+  with `report --status not_deployed --new`.
+- New operation: add it to `operations` in `config.js` with a `level` (its floor) and, if you like,
+  `rooms: [{ id, name }]` to name and order the rooms. If its agents use more than one id prefix,
+  list them in `agentPrefixes` and in `GATHERLANE_OPS`.
+- The building is generated from `config.js` (`app/js/layout.js`): one floor per `level`, one room
+  per agent `room` (default `team`) plus a lounge, a desk per agent, a look worked out from the id,
+  and a supervisor office when `maintainer` is set. To draw it by hand instead, define
+  `G.Building` in `building.js`; `examples/building-custom.js` is a full example.
 - Instance settings in `config.js`: `timeZone`, `timeZoneLabel` and `dayParts` (the words under
   the clock), `maintainer` (written in
   pause entries), `defaultLevel` (first floor on a phone), `extraTokenOwners`. Token owners are
@@ -200,6 +205,7 @@ CI (`.github/workflows/ci.yml`) runs all of these on every pull request. Locally
 ```sh
 npm ci && npx playwright install chromium   # Playwright is pinned to 1.49.0 in package.json
 npm run test:py        # reporter unit tests and the engine-is-generic check (standard library only)
+npm run test:layout    # the generated building: every agent placed once, in its room, no overlaps
 npm run test:browser   # sample mode and mocked live mode, against app/instance
 npm run test:example   # the same two, against examples/instance
 ```

@@ -26,9 +26,7 @@
   const levelOfOp = op => (CFG.operations[op] || {}).level;
   const opOfLevel = lv => Object.keys(CFG.operations).find(k => CFG.operations[k].level === lv);
   // Same rule as tools/gatherlane.py: an agentPrefixes match, else the id's first part, else the fallback.
-  const OPMAP = {};
-  for (const [k, o] of Object.entries(CFG.operations)) for (const p of o.agentPrefixes || []) OPMAP[p] = k;
-  const opOfId = id => { const head = id.split('/')[0]; return OPMAP[head] || OPMAP[head.split('-')[0]] || (id.includes('/') ? head : CFG.fallbackOperation || 'shared'); };
+  const opOfId = id => Layout.opOfId(CFG, id);
   const pathOf = id => { const parts = id.split('/'), op = opOfId(id); return `status/${op}/${parts.length === 2 && parts[0] === op ? parts[1] : id.replace('/', '-')}.json`; };
   const ownerOf = r => (r || '').split('/')[0];
   const OWNERS = [...new Set([ownerOf(CFG.statusRepo), ...allRepos.map(ownerOf), ...(CFG.extraTokenOwners || [])].filter(Boolean))];
@@ -191,7 +189,7 @@
     $('ctrl').innerHTML = (floor ? `<div class="ctrlrow"><span class="cb ghost"></span><button class="cb" data-move="up" aria-label="Walk up">▲</button><span class="cb ghost"></span></div>
       <div class="ctrlrow"><button class="cb" data-move="left" aria-label="Walk left">◀</button><button class="cb" data-move="down" aria-label="Walk down">▼</button><button class="cb" data-move="right" aria-label="Walk right">▶</button></div>` : '') +
       `<div class="ctrlrow"><button class="cb" data-act="rotl" title="Rotate (Shift+R)">⟲</button><button class="cb" data-act="rotr" title="Rotate (R)">⟳</button><button class="cb" data-act="zout" title="Zoom out (−)">−</button><button class="cb" data-act="zin" title="Zoom in (+)">+</button><button class="cb" data-act="fit" title="Fit (0)">⤢</button><button class="cb" data-act="legend" title="Legend">?</button></div>
-      <div class="help">${floor ? 'WASD / arrows walk · Enter talks · Esc back' : 'scroll or right-drag to pan · Ctrl+scroll zoom · 1–5 floors'} · I inbox · F focus</div>`;
+      <div class="help">${floor ? 'WASD / arrows walk · Enter talks · Esc back' : 'scroll or right-drag to pan · Ctrl+scroll zoom · 1–' + Math.max(1, ...LEVELS.map(L => L.key || 0)) + ' floors'} · I inbox · F focus</div>`;
   }
 
   function renderLegend() {
@@ -408,7 +406,7 @@
       if (mobileQ.matches && S.tab === 'inbox') { S.tab = 'floor'; applyTab(); return; }
       if (S.view === 'floor') goBuilding(); return;
     }
-    if (/^[1-5]$/.test(k)) { const L = LEVELS.find(l => String(l.key) === k); if (L) goFloor(L.id); return; }
+    if (/^[1-9]$/.test(k)) { const L = LEVELS.find(l => String(l.key) === k); if (L) goFloor(L.id); return; }
     if (k === 'i' || k === 'I') { if (mobileQ.matches) { S.tab = S.tab === 'inbox' ? 'floor' : 'inbox'; applyTab(); } else { const s = $('side'); s.classList.remove('flash'); void s.offsetWidth; s.classList.add('flash'); s.scrollTop = 0; const f = s.querySelector('.item .t'); if (f) f.focus(); } return; }
     if (k === 'f' || k === 'F') { S.focus = !S.focus; prefs.focus = S.focus; ls.set('gl.prefs', prefs); renderTop(); renderStage(false); return; }
     if (k === 'r') { S.rot = (S.rot + 1) & 3; renderStage(true); return; } if (k === 'R') { S.rot = (S.rot + 3) & 3; renderStage(true); return; }

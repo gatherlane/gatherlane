@@ -9,10 +9,11 @@ app/                 the site (deploy this folder)
   index.html, styles.css, _headers
   instance/          this office's own fleet                         ← edit these
     config.js        repos to watch, agent roles and runbook links
-    building.js      floors, rooms, furniture, characters
+    building.js      optional hand-drawn building (generated from config.js when empty)
     sample.js        SAMPLE data shown when no token is set
   js/                the engine, the same for every office
     render.js        isometric renderer and mascots
+    layout.js        generates the building from config.js
     office.js        floors → SVG, status interpretation (stale, paused)
     data.js          read-only GitHub client (status branch, PRs, runs, room panels)
     audio.js         procedural lo-fi and office sounds (off by default)

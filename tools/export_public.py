@@ -36,7 +36,8 @@ def names(config_path, root=ROOT):
     out.update(w for a in arrays for w in re.findall(r"'([\w.-]+)'", a))       # single words in arrays
     ops = re.search(r"operations:\s*{(.*?)\n    },", text, re.S)
     out.update(re.findall(r"^\s{6}([\w-]+):\s*{", ops.group(1), re.M) if ops else [])
-    out.update(i.split("/")[0] for i in re.findall(r"^\s+'([\w./-]+)':\s*{\s*role", text, re.M))
+    agents = text[text.find("agents: {"):]                                        # agent ids: keys of agents
+    out.update(i.split("/")[0] for i in re.findall(r"^\s+'([\w./-]+)':\s*{", agents, re.M))
     out.update(re.findall(r"maintainer:\s*'([\w.-]+)'", text))
     return {n.lower() for n in out if len(n) >= 4}
 
