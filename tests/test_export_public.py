@@ -28,6 +28,20 @@ class Export(unittest.TestCase):
         for f in ("LICENSE", "NOTICE", "CONTRIBUTING.md", "SECURITY.md", "CODE_OF_CONDUCT.md", "app/js/app.js", "tools/gatherlane.py"):
             self.assertTrue(os.path.exists(os.path.join(out, f)), f)
 
+    def test_identity_sets_author_and_committer(self):
+        out = os.path.join(tempfile.mkdtemp(), "public")
+        r = subprocess.run([sys.executable, TOOL, out, "--identity", "Robin <1+robin@users.noreply.github.com>"],
+                           cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = subprocess.run(["git", "log", "-1", "--format=%an <%ae>|%cn <%ce>"], cwd=out, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(log, "Robin <1+robin@users.noreply.github.com>|Robin <1+robin@users.noreply.github.com>")
+
+    def test_bad_identity_commits_nothing(self):
+        out = os.path.join(tempfile.mkdtemp(), "public")
+        r = subprocess.run([sys.executable, TOOL, out, "--identity", "no email here"], cwd=ROOT, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(out, ".git", "HEAD")))
+
     def test_refuses_a_non_empty_directory(self):
         out = tempfile.mkdtemp()
         open(os.path.join(out, "x"), "w").close()
