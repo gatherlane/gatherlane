@@ -79,10 +79,16 @@ expired token shows as errors in Settings → connections, not as fake data.
 
 In the app: ⚙ → paste each token → tick "Remember tokens on this device" only on your own
 devices → Save. The pill turns green (**LIVE**) and Settings lists every repo as ok or with its
-error code. It also lists agents whose status files the app read but that are on no floor (add
-them to `agents` in `config.js`, or to `building.js` if you draw the building by hand), and agents
-on a floor with no status file yet (register one with
-`gatherlane report --agent <id> --new --status not_deployed`, or wait for its first run).
+error code. A repo whose owner has no token is not read at all, even when it is public: its row
+says `no token for <owner>`, and a room panel lists it under "Could not read". Settings also lists
+agents whose status files the app read but that are on no floor (add them to `agents` in
+`config.js`, or to `building.js` if you draw the building by hand), and agents on a floor with no
+status file yet (register one with `gatherlane report --agent <id> --new --status not_deployed`,
+or wait for its first run).
+
+A token stored under the owner `*` in the `gl.tokens` entry of the browser's storage is used for
+any owner without its own token. Settings has no field for it, and Save rewrites `gl.tokens` from
+the fields it shows, so a `*` token set by hand is gone after the next Save.
 
 **Optional: Run now.** "Run workflow" opens GitHub's dispatch page by default. To start runs from
 Gatherlane itself, add a separate token per owner with Actions: Read and write on the agent repos

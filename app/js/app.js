@@ -22,6 +22,8 @@
   };
   const D = { mode: 'sample', rows: [], control: { paused: {} }, prs: [], runs: [], statusErr: null, invalid: [], prErr: {}, runErr: {}, updated: null, rate: null };
   const allRepos = [...new Set(Object.values(CFG.operations).flatMap(o => o.repos))];
+  // A repo is labelled by its name, or by owner/name when another watched repo has the same name.
+  const repoLabel = r => { const n = r.split('/')[1]; return allRepos.some(x => x !== r && x.split('/')[1] === n) ? r : n; };
   const opForRepo = r => Object.keys(CFG.operations).find(k => CFG.operations[k].repos.includes(r));
   const levelOfOp = op => (CFG.operations[op] || {}).level;
   const opOfLevel = lv => Object.keys(CFG.operations).find(k => CFG.operations[k].level === lv);
@@ -96,7 +98,7 @@
     const items = [];
     for (const p of D.prs) for (const l of p.labels || []) {
       const kind = CFG.inboxLabels[l]; if (!kind) continue;
-      items.push({ kind, tone: kind === 'ready to merge' ? 'ok' : 'warn', group: 'pr', title: `${p.repo.split('/')[1]} #${p.number} · ${p.title}`, url: p.url, link: 'Open PR', source: p.source, op: opForRepo(p.repo), agent: null });
+      items.push({ kind, tone: kind === 'ready to merge' ? 'ok' : 'warn', group: 'pr', title: `${repoLabel(p.repo)} #${p.number} · ${p.title}`, url: p.url, link: 'Open PR', source: p.source, op: opForRepo(p.repo), agent: null });
     }
     for (const r of D.rows) {
       if (!(r.needs_human || r.status === 'failed')) continue;
@@ -106,7 +108,7 @@
       const link = L.issue ? 'Open issue' : L.pr ? 'Open PR' : r.last_result_url ? 'Open run' : url ? 'Open runbook' : null;
       items.push({ kind, tone: kind === 'failed run' ? 'bad' : kind === 'escalation' ? 'warn' : 'info', group: kind === 'failed run' ? 'failed' : kind === 'escalation' ? 'esc' : 'other', title: `${(agentDef(r.agent) || { name: r.agent }).name} — ${r.needs_human_reason || 'run failed'}`, url, link, source: r.source, op: r.operation, agent: r.agent });
     }
-    for (const run of D.runs) items.push({ kind: 'failed run', tone: 'bad', group: 'failed', title: `${run.repo.split('/')[1]} · workflow “${run.name}” failed on ${run.branch}`, url: run.url, link: 'Open run', source: run.source, op: opForRepo(run.repo), agent: null });
+    for (const run of D.runs) items.push({ kind: 'failed run', tone: 'bad', group: 'failed', title: `${repoLabel(run.repo)} · workflow “${run.name}” failed on ${run.branch}`, url: run.url, link: 'Open run', source: run.source, op: opForRepo(run.repo), agent: null });
     const rank = { 'escalation': 0, 'failed run': 1, 'ready to merge': 2, 'needs maintainer': 3, 'approval': 4, 'review': 5, 'needs you': 6 };
     return items.sort((a, b) => rank[a.kind] - rank[b.kind]);
   }
@@ -239,7 +241,7 @@
       h += `<span>Status</span><span>${D.mode === 'sample' ? 'Not in the sample set.' : `No status file at <code>${esc(pathOf(id))}</code> yet.`} Nothing is shown until the agent reports.</span>`;
     }
     h += `</div><div class="levers">`;
-    h += L.issue ? lever(L.issue, 'Open issue', 'from status file') : L.pr ? lever(L.pr, 'Open PR', 'from status file') : lever(cfgA.repo ? `${ghUrl(cfgA.repo)}/issues` : null, 'Open issues', cfgA.repo ? cfgA.repo.split('/')[1] : 'no issue linked');
+    h += L.issue ? lever(L.issue, 'Open issue', 'from status file') : L.pr ? lever(L.pr, 'Open PR', 'from status file') : lever(cfgA.repo ? `${ghUrl(cfgA.repo)}/issues` : null, 'Open issues', cfgA.repo ? repoLabel(cfgA.repo) : 'no issue linked');
     h += lever(runbook, 'Open runbook', runbook ? 'on GitHub' : 'no runbook found');
     h += lever(L.workflow, 'Run workflow', L.workflow ? 'opens GitHub dispatch page' : 'no workflow in status file');
     h += `<button class="lv dark" data-pause="${esc(id)}" data-href="${esc(editPause)}">${r.paused ? '▶ Resume agent' : '❚❚ Pause agent'}<small>${r.paused ? 'remove its entry in' : 'copies entry, opens'} control/pause.json</small></button>`;
@@ -256,23 +258,29 @@
     let h = `<div class="card" data-card="room"><button class="x" data-close="room" aria-label="Close">×</button><h3 style="font-size:15px">${esc(room.name)} · ${esc(op.name || L.name)} ${D.mode === 'sample' ? '<span class="tag sample">SAMPLE</span>' : repos.length ? '<span class="tag live">LIVE</span>' : ''}</h3>`;
     if (!repos.length) return h + `<div class="role">No GitHub repos are configured for this operation${op.note ? ` (${esc(op.note)})` : ''}. Add them in <code>instance/config.js</code>.</div></div>`;
     if (D.mode === 'sample') {
-      return h + `<div class="role">${repos.map(r => r.split('/')[1]).join(' · ')}</div><div class="section">Issues by milestone</div><div class="row-i"><span>Sample milestone A</span><span>4 open</span></div><div class="row-i"><span>Sample milestone B</span><span>7 open</span></div><div class="section">Open PRs</div><div class="row-i"><span>#57 sample PR</span><span class="lbl ok">review:approved</span></div><div class="row-i"><span>#60 sample PR</span><span class="lbl n">no review label</span></div><div class="section">Changelog</div><div class="row-i"><span>sample merged PR</span><span>25 Oct</span></div></div>`;
+      return h + `<div class="role">${repos.map(r => repoLabel(r)).join(' · ')}</div><div class="section">Issues by milestone</div><div class="row-i"><span>Sample milestone A</span><span>4 open</span></div><div class="row-i"><span>Sample milestone B</span><span>7 open</span></div><div class="section">Open PRs</div><div class="row-i"><span>#57 sample PR</span><span class="lbl ok">review:approved</span></div><div class="row-i"><span>#60 sample PR</span><span class="lbl n">no review label</span></div><div class="section">Changelog</div><div class="row-i"><span>sample merged PR</span><span>25 Oct</span></div></div>`;
     }
     const ck = repos.join(','), c = roomCache.get(ck);
     if (!c || Date.now() - c.at > 120000) {
-      if (!c || !c.loading) { roomCache.set(ck, { loading: true, at: Date.now(), data: c && c.data }); GLData.loadRoom(gh, repos).then(d => { roomCache.set(ck, { at: Date.now(), data: d }); renderCards(); }).catch(() => {}); }
-      if (!c || !c.data) return h + `<div class="role">${repos.map(r => r.split('/')[1]).join(' · ')}</div><div class="empty">Loading from GitHub…</div></div>`;
+      // Save replaces gh and clears the cache, so a room read started with the old tokens is dropped
+      if (!c || !c.loading) { const g = gh = gh || new GLData.GitHub(tokens); roomCache.set(ck, { loading: true, at: Date.now(), data: c && c.data }); GLData.loadRoom(g, repos).then(d => { if (g !== gh) return; roomCache.set(ck, { at: Date.now(), data: d }); renderCards(); }).catch(() => {}); }
+      if (!c || !c.data) return h + `<div class="role">${repos.map(r => repoLabel(r)).join(' · ')}</div><div class="empty">Loading from GitHub…</div></div>`;
     }
     const d = (roomCache.get(ck) || c).data;
-    h += `<div class="role">${repos.map(r => `<a href="${ghUrl(r)}" target="_blank" rel="noopener">${r.split('/')[1]}</a>`).join(' · ')}</div>`;
-    h += `<div class="section">Issues by milestone</div>`;
+    h += `<div class="role">${repos.map(r => `<a href="${ghUrl(r)}" target="_blank" rel="noopener">${repoLabel(r)}</a>`).join(' · ')}</div>`;
+    // when no repo could be read, empty lists would claim there is nothing open; show only the errors
+    const errs = Object.entries(d.errors), cannot = `<div class="section">Could not read</div>` + errs.map(([r, e]) => `<div class="row-i"><span>${esc(r)}</span><span class="lbl bad">${esc(e)}</span></div>`).join('');
+    if (errs.length === repos.length) return h + cannot + '</div>';
+    // when some repos could not be read, say so first, and name the repos the lists cover
+    const scope = errs.length ? ` in ${repos.filter(r => !(r in d.errors)).map(r => esc(repoLabel(r))).join(', ')}` : '';
+    if (errs.length) h += cannot;
+    h += `<div class="section">Issues by milestone${errs.length ? ` (${scope.trim()})` : ''}</div>`;
     const ms = Object.entries(d.milestones).sort((a, b) => (a[0] === 'No milestone') - (b[0] === 'No milestone') || b[1].open - a[1].open);
-    h += ms.length ? ms.slice(0, 8).map(([m, v]) => `<div class="row-i"><span>${esc(m)}</span><span>${v.open} open</span></div>`).join('') : '<div class="row-i"><span>No open issues</span></div>';
-    h += `<div class="section">Open PRs (${d.prs.length})</div>`;
-    h += d.prs.length ? d.prs.slice(0, 10).map(p => { const rl = p.labels.find(l => l.startsWith('review:')); const cls = rl === 'review:approved' ? 'ok' : rl === 'review:needs-maintainer' ? 'warn' : rl === 'review:changes-requested' ? 'bad' : 'n'; return `<div class="row-i"><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.repo.split('/')[1])} #${p.number} ${esc(p.title.slice(0, 48))}</a><span class="lbl ${cls}">${esc(rl || 'no review label')}</span></div>`; }).join('') : '<div class="row-i"><span>None open</span></div>';
+    h += ms.length ? ms.slice(0, 8).map(([m, v]) => `<div class="row-i"><span>${esc(m)}</span><span>${v.open} open</span></div>`).join('') : `<div class="row-i"><span>No open issues${scope}</span></div>`;
+    h += `<div class="section">Open PRs (${d.prs.length}${scope})</div>`;
+    h += d.prs.length ? d.prs.slice(0, 10).map(p => { const rl = p.labels.find(l => l.startsWith('review:')); const cls = rl === 'review:approved' ? 'ok' : rl === 'review:needs-maintainer' ? 'warn' : rl === 'review:changes-requested' ? 'bad' : 'n'; return `<div class="row-i"><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(repoLabel(p.repo))} #${p.number} ${esc(p.title.slice(0, 48))}</a><span class="lbl ${cls}">${esc(rl || 'no review label')}</span></div>`; }).join('') : `<div class="row-i"><span>None open${scope}</span></div>`;
     h += `<div class="section">Changelog (merged)</div>`;
-    h += d.merged.length ? d.merged.slice(0, 6).map(p => `<div class="row-i"><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.repo.split('/')[1])} #${p.number} ${esc(p.title.slice(0, 44))}</a><span>${fmt(p.at, true).replace(/ \d\d:\d\d .*$/, '')}</span></div>`).join('') : '<div class="row-i"><span>No merged PRs recently</span></div>';
-    const errs = Object.entries(d.errors); if (errs.length) h += `<div class="section">Could not read</div>` + errs.map(([r, e]) => `<div class="row-i"><span>${esc(r)}</span><span class="lbl bad">${esc(e)}</span></div>`).join('');
+    h += d.merged.length ? d.merged.slice(0, 6).map(p => `<div class="row-i"><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(repoLabel(p.repo))} #${p.number} ${esc(p.title.slice(0, 44))}</a><span>${fmt(p.at, true).replace(/ \d\d:\d\d .*$/, '')}</span></div>`).join('') : `<div class="row-i"><span>No merged PRs recently${scope}</span></div>`;
     return h + '</div>';
   }
 
@@ -465,7 +473,7 @@
     prefs.remember = $('remember').checked; prefs.useSample = $('useSample').checked; ls.set('gl.prefs', prefs);
     ['gl.tokens', 'gl.dtokens'].forEach(k => { ls.del(k); ls.del(k, true); });
     ls.set('gl.tokens', nt, !prefs.remember); ls.set('gl.dtokens', nd, !prefs.remember);
-    tokens = nt; dtokens = nd; gh = null; lastRuns = 0; D.updated = null; // a read still in flight is dropped, so D.updated next comes from a read with these tokens
+    tokens = nt; dtokens = nd; gh = null; roomCache.clear(); lastRuns = 0; D.updated = null; // a read still in flight is dropped, so D.updated next comes from a read with these tokens
     $('settings').hidden = true; refresh(true);
   };
 

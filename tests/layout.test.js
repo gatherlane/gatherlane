@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Checks the generated building (app/js/layout.js): node tests/layout.test.js
 // Runs on the example config, this repository's instance config, and small edge cases.
+// A hand-drawn instance building.js is checked against its config.js too.
 const assert = require('assert'), path = require('path'), fs = require('fs');
 const load = f => { delete globalThis.GATHERLANE_CONFIG; delete globalThis.Building; delete require.cache[path.resolve(f)]; require(path.resolve(f)); return globalThis.GATHERLANE_CONFIG; };
 delete require.cache[require.resolve('../app/js/layout.js')];
@@ -116,6 +117,37 @@ run('the example and instance configs pass the check', () => {
     assert.deepStrictEqual(globalThis.Layout.check(cfg, fromConfig(cfg).LEVELS, []).problems, [], f);
   }
 });
+
+// A hand-drawn building.js is what the instance renders, so it is held to config.js the same way.
+// examples/building-custom.js is the hand-drawn reference for the example config. A building.js that
+// defines no Building is left to the generated one, which the checks above cover, so it is a skip.
+const drawnChecks = [
+  ['examples/instance', 'examples/instance/config.js', 'examples/instance/building.js'],
+  ['app/instance', 'app/instance/config.js', 'app/instance/building.js'],
+  ['examples/building-custom.js', 'examples/instance/config.js', 'examples/building-custom.js'],
+];
+for (const [name, cfgFile, bFile] of drawnChecks) {
+  if (!fs.existsSync(cfgFile) || !fs.existsSync(bFile)) continue;
+  const label = `${name}: the building drawn matches config.js`;
+  const cfg = load(cfgFile);
+  delete require.cache[require.resolve('../app/js/render.js')]; require('../app/js/render.js');
+  const f = path.resolve(bFile); delete require.cache[f]; require(f);
+  if (!globalThis.Building) { results.push(`skip ${label} (no Building defined, the generated one is used)`); continue; }
+  run(label, () => {
+    const LEVELS = globalThis.Building.LEVELS;
+    const drawn = LEVELS.flatMap(L => L.agents.filter(a => !a.human && !a.decor && !a.walker).map(a => ({ id: a.id, L: L.id })));
+    for (const id of Object.keys(cfg.agents)) {
+      const at = drawn.filter(a => a.id === id);
+      assert.strictEqual(at.length, 1, `${id} is drawn exactly once, not ${at.length} times`);
+      const lv = (cfg.operations[opOfId(cfg, id)] || {}).level;
+      if (lv) assert.strictEqual(at[0].L, lv, `${id} is drawn on its operation's level`);
+    }
+    const keys = LEVELS.map(L => L.key).filter(Boolean);
+    assert.deepStrictEqual([...keys].sort((a, b) => a - b), keys.map((_, i) => i + 1), `floor keys are unique and run 1..n: ${keys}`);
+    const { problems, unplaced } = globalThis.Layout.check(cfg, LEVELS, Object.keys(cfg.agents));
+    assert.deepStrictEqual({ problems, unplaced }, { problems: [], unplaced: [] }, 'Layout.check: no problems, nothing unplaced');
+  });
+}
 
 console.log(results.join('\n'));
 process.exit(results.some(r => r.startsWith('FAIL')) ? 1 : 0);

@@ -2,7 +2,8 @@
 // Exercises the live code path against a mocked api.github.com: node tests/live-mock.js <outdir>
 // One invalid status file, two agents missing from config.js (one with markup for an id) and one 404 repo
 // are injected on purpose; the checks below expect them. Then: a status branch that is not found, Save
-// with a read in flight (new tokens, and sample data), and a scratch config with a problem.
+// with a read in flight (new tokens, and sample data), a slow refresh then Save with a room panel open,
+// and a scratch config with a problem.
 const { chromium } = require('playwright');
 const { appUrl, scratchApp, readInstance, pathOf } = require('./app-under-test');
 const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64');
@@ -72,6 +73,8 @@ const EVIL = '<img src=x onerror="window.__evil=1">';
   const row = start => (conn.find(([k]) => k.startsWith(start)) || [])[1];
   st.unplaced = row('Reporting, but on no floor'); st.silent = row('On a floor, but no status file') || '';
   st.hint = (conn.find(([k]) => k.startsWith('Reporting, but on no floor')) || [])[0];
+  const prTitle = pg => pg.evaluate(() => [...document.querySelectorAll('#side .item .t')].map(b => b.textContent).find(t => t.includes('#93 ')));
+  st.title = await prTitle(p); // a repo name no other watched repo has is shown on its own
   st.markup = await p.evaluate(() => ({ imgs: document.querySelectorAll('#conn img').length, ran: !!window.__evil }));
   const generated = await p.evaluate(() => !!Building.generated);
   const lists = pg => pg.evaluate(() => [...document.querySelectorAll('#conn .conn div span')].filter(s => /^(Reporting|On a floor)/.test(s.textContent)).length);
@@ -121,6 +124,66 @@ const EVIL = '<img src=x onerror="window.__evil=1">';
   await sv.click('#settingsBtn'); await sv.waitForTimeout(200);
   Object.assign(st.saveMidRead, { newReqs: newAuth > 0, err: await sv.evaluate(() => !!__gl.D.statusErr), lists: await lists(sv) });
   await sv.close();
+  // An owner with no token: nothing goes out for its repo, Settings and the room data show the missing
+  // token and never "ok". The repo shares its name with prRepo, so the inbox labels prRepo owner/name.
+  const twinOwner = 'mirror-owner', twin = `${twinOwner}/${prRepo.split('/')[1]}`;
+  const nt = await ctx.newPage(); nt.on('pageerror', e => errs.push(e.message));
+  await nt.goto(scratchApp(process.env.GATHERLANE_INSTANCE || 'app/instance', `Object.values(GATHERLANE_CONFIG.operations).find(o => (o.repos || []).includes(${JSON.stringify(prRepo)})).repos.push(${JSON.stringify(twin)});`));
+  st.noToken = { read: await readDone(nt) };
+  await nt.click('#settingsBtn'); await nt.waitForTimeout(200);
+  await nt.screenshot({ path: out + '/live-notoken-settings.png' });
+  const ntConn = await nt.evaluate(() => [...document.querySelectorAll('#conn .conn div')].map(d => [d.children[0].textContent, d.children[1].textContent]));
+  Object.assign(st.noToken, {
+    row: (ntConn.find(([k]) => k === twin) || [])[1], prRow: (ntConn.find(([k]) => k === prRepo) || [])[1],
+    room: await nt.evaluate(r => GLData.loadRoom(new GLData.GitHub(JSON.parse(localStorage.getItem('gl.tokens'))), [r]).then(d => d.errors[r]), twin),
+    sent: seen.filter(s => s.startsWith(`/repos/${twinOwner}/`)).length, title: await prTitle(nt),
+  });
+  await nt.close();
+  // The room panel, driven through the UI: the first room of the first floor is given `roomRepos`. A room
+  // where no repo was read shows only the errors. A room read in part shows the errors first and names
+  // the repos its lists cover, never a bare "None open". Save with the missing token reads it again.
+  const quiet = `${prRepo.split('/')[0]}/quiet-repo`, other = `${twinOwner}/other`;
+  const roomPanel = pg => pg.evaluate(() => { const c = document.querySelector('[data-card="room"]'); return c && { header: c.querySelector('.role').textContent, sections: [...c.querySelectorAll('.section')].map(x => x.textContent), rows: [...c.querySelectorAll('.row-i')].map(x => [...x.children].map(y => y.textContent).join(' | ')) }; });
+  const roomLoaded = pg => pg.waitForFunction(() => { const c = document.querySelector('[data-card="room"]'); return c && !c.querySelector('.empty'); }, null, { timeout: 8000 }).then(() => true, () => false);
+  const roomFloor = async roomRepos => {
+    const [lv, rid] = inst.first.room.split(':');
+    const pg = await ctx.newPage(); pg.on('pageerror', e => errs.push(e.message));
+    await pg.goto(scratchApp(process.env.GATHERLANE_INSTANCE || 'app/instance', `(o => { o.repos.push(...${JSON.stringify(roomRepos)}.filter(r => !o.repos.includes(r))); o.roomRepos = Object.assign({}, o.roomRepos, { ${JSON.stringify(rid)}: ${JSON.stringify(roomRepos)} }); })(Object.values(GATHERLANE_CONFIG.operations).find(o => o.level === ${JSON.stringify(lv)}));`));
+    await readDone(pg);
+    await pg.keyboard.press(inst.first.key); await pg.waitForTimeout(300);
+    return pg;
+  };
+  const clickRoom = async pg => {
+    const rb = await pg.locator(`[data-room="${inst.first.room}"]`).first().boundingBox();
+    await pg.mouse.click(rb.x + rb.width * .3, rb.y + rb.height * .6);
+  };
+  const openRoom = async (roomRepos, shot) => {
+    const pg = await roomFloor(roomRepos);
+    await clickRoom(pg);
+    await roomLoaded(pg); await pg.screenshot({ path: `${out}/${shot}.png` });
+    return pg;
+  };
+  const allFail = await openRoom([twin, other], 'live-room-allfailed');
+  st.roomAllFailed = await roomPanel(allFail); await allFail.close();
+  const part = await openRoom([quiet, twin], 'live-room-partial');
+  st.roomPartial = await roomPanel(part);
+  await part.click('#settingsBtn'); await part.waitForTimeout(200);
+  await part.fill(`#t-${twinOwner}`, 'tm'); await part.click('#setSave');
+  await readDone(part); await roomLoaded(part); await part.waitForTimeout(300);
+  st.roomAfterSave = await roomPanel(part); await part.close();
+  // A slow refresh, then Save: the room read started with the old tokens is still in flight and is
+  // dropped when it returns after the new one, and the room panel opened while the refresh is still
+  // running reads with the new tokens rather than with no client at all
+  const slow = await roomFloor([quiet, twin]);
+  hold = () => true;
+  await clickRoom(slow); await slow.waitForTimeout(200); // old room read, held
+  await slow.evaluate(() => { __gl.refresh(true); }); await slow.waitForTimeout(200); // old status read, held
+  await slow.click('#settingsBtn'); await slow.waitForTimeout(200);
+  await slow.fill(`#t-${twinOwner}`, 'tm'); await slow.click('#setSave'); await slow.waitForTimeout(200);
+  hold = null;
+  await clickRoom(slow); await roomLoaded(slow); await slow.waitForTimeout(300);
+  release(); await readDone(slow); await slow.waitForTimeout(500);
+  st.roomSlowSave = await roomPanel(slow); await slow.close();
   // A config.js with a problem: toast and console warning at start, a config.js row in Settings
   const cp = await (await b.newContext({ viewport: { width: 1600, height: 950 } })).newPage(); const warns = [];
   cp.on('console', m => { if (m.type() === 'warning') warns.push(m.text()); });
@@ -137,6 +200,13 @@ const EVIL = '<img src=x onerror="window.__evil=1">';
     toSample: { mode: 'sample', liveRows: 0, lists: 0 },
     saveMidRead: { oldDone: { updated: null, lists: 0 }, newRead: true, newReqs: true, err: true, lists: 0 },
     badConfig: { toast: 'config.js has 1 problem; see Settings', warns: 1, rows: 1, lists: 0 },
+    noToken: { read: true, row: `no token for ${twinOwner}`, prRow: 'ok', room: `no token for ${twinOwner}`, sent: 0, title: `${prRepo} #93 · mock PR` },
+    roomAllFailed: { header: `${twin} · other`, sections: ['Could not read'], rows: [`${twin} | no token for ${twinOwner}`, `${other} | no token for ${twinOwner}`] },
+    roomPartial: { header: `quiet-repo · ${twin}`, sections: ['Could not read', 'Issues by milestone (in quiet-repo)', 'Open PRs (0 in quiet-repo)', 'Changelog (merged)'],
+      rows: [`${twin} | no token for ${twinOwner}`, 'R1: mock | 1 open', 'None open in quiet-repo', 'No merged PRs recently in quiet-repo'] },
+    roomAfterSave: { header: `quiet-repo · ${twin}`, sections: ['Issues by milestone', 'Open PRs (0)', 'Changelog (merged)'], rows: ['R1: mock | 2 open', 'None open', 'No merged PRs recently'] },
+    roomSlowSave: { header: `quiet-repo · ${twin}`, sections: ['Issues by milestone', 'Open PRs (0)', 'Changelog (merged)'], rows: ['R1: mock | 2 open', 'None open', 'No merged PRs recently'] },
+    title: `${inst.repos.filter(r => r.split('/')[1] === prRepo.split('/')[1]).length > 1 ? prRepo : prRepo.split('/')[1]} #93 · mock PR`,
     earlyLists: 0, invalid: 1, prs: prRepo === okRepo ? 1 : 2, runs: 1, prErr: missingRepo ? [missingRepo] : [] };
   const fails = Object.keys(want).filter(k => JSON.stringify(st[k]) !== JSON.stringify(want[k])).map(k => `${k}: got ${JSON.stringify(st[k])}, want ${JSON.stringify(want[k])}`);
   if (errs.length) fails.push('page errors: ' + errs.join(' | '));

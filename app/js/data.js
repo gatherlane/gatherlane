@@ -8,10 +8,12 @@
     constructor(tokens) { this.tokens = tokens || {}; this.cache = new Map(); this.rate = null; }
     tokenFor(repo) { const owner = (repo || '').split('/')[0]; return this.tokens[owner] || this.tokens['*'] || null; }
     hasToken() { return Object.values(this.tokens).some(Boolean); }
+    // A repo whose owner has no token is not read at all. A public repo answers without one, and its data
+    // would then look healthy while the owner's token is missing, so the caller shows this error instead.
     async req(path, repo, opt = {}) {
       const tok = this.tokenFor(repo);
-      const headers = { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
-      if (tok) headers.Authorization = `Bearer ${tok}`;
+      if (!tok) { const e = new Error(`no token for ${(repo || '').split('/')[0] || 'this repo'}`); e.path = path; throw e; }
+      const headers = { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', Authorization: `Bearer ${tok}` };
       const c = this.cache.get(path);
       if (c && c.etag && !opt.method) headers['If-None-Match'] = c.etag;
       const res = await fetch(API + path, { method: opt.method || 'GET', headers: opt.body ? { ...headers, 'Content-Type': 'application/json' } : headers, body: opt.body ? JSON.stringify(opt.body) : undefined, cache: 'no-store' });
