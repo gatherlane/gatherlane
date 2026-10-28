@@ -24,8 +24,12 @@ Commands
   check-pause  --agent ID                               exit 3 if paused, 0 otherwise
   validate     FILE ...                                 check local status files against the contract
   init-branch                                           create the status branch with control/pause.json
+  init         --repo OWNER/REPO --agent ID ... [--watch [OP:]OWNER/REPO ...] [--maintainer NAME]
+               set up a new office: check the token, create the status branch, write a starter
+               app/instance/ (generated building, SAMPLE data), register the agents as
+               not_deployed, add the settings to the env file, and print the remaining steps
 """
-import argparse, base64, datetime as dt, json, os, shlex, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
+import argparse, base64, datetime as dt, json, os, re, shlex, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
 from zoneinfo import ZoneInfo
 
 SCHEMA = "gatherlane.agent-status/v1"
@@ -379,6 +383,137 @@ def cmd_init_branch(a):
     print("ok")
 
 
+# ---------- init: a new office ----------
+ID_RE = r"[a-z0-9][a-z0-9_.-]*(/[a-z0-9][a-z0-9_.-]*)?"
+
+
+def js(v, indent=0):
+    """A value as JavaScript in the style of the example instance (single quotes, bare keys)."""
+    pad, inner = "  " * indent, "  " * (indent + 1)
+    if isinstance(v, dict):
+        if not v:
+            return "{}"
+        key = lambda k: k if re.fullmatch(r"[A-Za-z_$][\w$]*", k) else js(k)
+        return "{\n" + "".join(f"{inner}{key(k)}: {js(x, indent + 1)},\n" for k, x in v.items()) + pad + "}"
+    if isinstance(v, list):
+        return "[" + ", ".join(js(x, indent) for x in v) + "]"
+    if isinstance(v, str):  # JSON escapes every control character and U+2028; then swap to single quotes
+        return "'" + json.dumps(v)[1:-1].replace('\\"', '"').replace("'", "\\'") + "'"
+    return "null" if v is None else json.dumps(v)
+
+
+def main_operation(ops):
+    """The first operation that is not the shared den, for defaults."""
+    return next((k for k in ops if k != FALLBACK_OP), next(iter(ops)))
+
+
+def starter_instance(a, ops, agents):
+    first = main_operation(ops)
+    cfg = {"statusRepo": a.repo, "statusBranch": branch(), "refreshSeconds": 120, "runsRefreshSeconds": 300,
+           "timeZone": tz_name(), "maintainer": a.maintainer or "maintainer", "defaultLevel": ops[first]["level"],
+           "fallbackOperation": FALLBACK_OP, "extraTokenOwners": [], "operations": ops,
+           "inboxLabels": {"review:approved": "ready to merge", "review:needs-maintainer": "needs maintainer"},
+           "agents": {i: {"role": "", "runbook": None} for i in agents}}
+    today = dt.date.today().isoformat()
+    config = (f"// Gatherlane configuration, written by `gatherlane init` on {today}. Edit freely:\n"
+              "// docs/SETUP.md, \"Adding or changing agents and repos\", lists every setting.\n"
+              "(function (G) {\n  G.GATHERLANE_CONFIG = " + js(cfg, 1) + ";\n"
+              "  G.GATHERLANE_CONFIG.gh = r => `https://github.com/${r}`;\n"
+              "})(typeof window !== 'undefined' ? window : globalThis);\n")
+    building = ("// The building is generated from config.js (app/js/layout.js). To draw it by hand, define\n"
+                "// G.Building here; examples/building-custom.js is a full example.\n")
+    cycle = ["running", "idle", "sleeping"]
+    rows = []
+    for n, i in enumerate(agents):
+        r = {"schema": SCHEMA, "agent": i, "operation": operation_of(i), "status": cycle[n % 3], "needs_human": False,
+             "current_task": {"title": "Sample task", "url": None} if n % 3 == 0 else None,
+             "updated_at": "2026-01-01T09:00:00Z", "source": "sample"}
+        if n == 0 and len(agents) > 1:
+            r.update(status="waiting", needs_human=True, needs_human_kind="escalation",
+                     needs_human_reason="Sample: this is what an escalation looks like")
+        rows.append(r)
+    sample = ("// SAMPLE status records, shown until tokens are added. Every record carries source:\"sample\";\n"
+              "// nothing here is a live reading.\n(function (G) {\n"
+              f"  G.SAMPLE = {js({'rows': rows, 'prs': [], 'control': {'schema': 'gatherlane.control/v1', 'paused': {}, 'source': 'sample'}, 'now': '2026-01-01T09:30:00Z'}, 1)};\n"
+              "})(typeof window !== 'undefined' ? window : globalThis);\n")
+    return {"config.js": config, "building.js": building, "sample.js": sample}
+
+
+def add_env_settings(path, settings):
+    """Append settings the env file does not have yet. Never writes the token."""
+    path = os.path.expanduser(path)
+    have = open(path).read() if os.path.exists(path) else ""
+    new = [f"export {k}={shlex.quote(v)}" for k, v in settings.items() if not re.search(rf"^\s*(export\s+)?{k}=", have, re.M)]
+    if new:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(("" if not have or have.endswith("\n") else "\n") + "\n".join(new) + "\n")
+    return new
+
+
+def cmd_init(a):
+    bad = [i for i in a.agent if not re.fullmatch(ID_RE, i)]
+    if bad:
+        sys.exit(f"agent ids are <operation>/<agent> in lower case, for example web/implementer: {', '.join(bad)}")
+    if a.repo.count("/") != 1:
+        sys.exit("--repo is the owner/repo that will hold the status branch")
+    os.environ["GATHERLANE_REPO"] = a.repo
+    if a.tz:
+        os.environ["GATHERLANE_TZ"] = a.tz
+    tz()  # exits on a bad zone
+    out = os.path.abspath(a.instance)
+    if os.path.exists(os.path.join(out, "config.js")) and not a.force:
+        sys.exit(f"{out} already has a config.js; pass --force to replace the instance")
+    if not env("GATHERLANE_TOKEN"):
+        sys.exit(f"GATHERLANE_TOKEN is not set. Create a fine-grained token for {a.repo} only, with Contents: read "
+                 f"and write, put `export GATHERLANE_TOKEN=...` in {a.env_file} (chmod 600), and run init again.")
+    code, info = gh("GET", f"/repos/{a.repo}")
+    if code != 200:
+        sys.exit(f"{a.repo}: {code} {info.get('message')}. Create the repository first, or check the token's access.")
+
+    ops = {}
+    for i in a.agent:
+        op = operation_of(i)
+        ops.setdefault(op, {"name": op.replace("-", " ").title(), "level": "den" if op == FALLBACK_OP else op, "repos": []})
+    for w in a.watch:
+        op, _, r = w.rpartition(":")
+        op = op or main_operation(ops)
+        if op not in ops or r.count("/") != 1:
+            sys.exit(f"--watch {w}: use OWNER/REPO, or OPERATION:OWNER/REPO with an operation from your agent ids")
+        ops[op]["repos"].append(r)
+
+    cmd_init_branch(a)
+    os.makedirs(out, exist_ok=True)
+    for name, text in starter_instance(a, ops, a.agent).items():
+        with open(os.path.join(out, name), "w") as f:
+            f.write(text)
+    print(f"wrote {out}/config.js, building.js, sample.js")
+    for i in a.agent:
+        if read_file(path_of(i))[0] is None:
+            cmd_report(ns(agent=i, status="not_deployed"))
+        else:
+            print(f"{i}: already has a status file, left as it is")
+    added = add_env_settings(a.env_file, {"GATHERLANE_REPO": a.repo, "GATHERLANE_TZ": tz_name()})
+    if added:
+        print(f"added to {a.env_file}: {', '.join(l.split('=')[0].split()[-1] for l in added)}")
+
+    watched = sorted({r for o in ops.values() for r in o["repos"]})
+    owners = sorted({a.repo.split("/")[0], *(r.split("/")[0] for r in watched)})
+    print("\nNext:")
+    if watched:
+        print("1. Review labels in the watched repos (needs gh with write access there):")
+        for r in watched:
+            for n, c, d in [("review:approved", "0e8a16", "Reviewed and ready for the maintainer to merge"),
+                            ("review:changes-requested", "d93f0b", "Review found blocking issues"),
+                            ("review:needs-maintainer", "fbca04", "Needs a maintainer decision")]:
+                print(f"   gh label create {n} -R {r} --color {c} --description {shlex.quote(d)}")
+    print(f"2. Read-only tokens for the page, one per owner ({', '.join(owners)}): Contents, Issues, Pull requests,")
+    print("   Actions and Metadata, all read-only. Add them in the page under Settings.")
+    print("3. Host app/ (docs/SETUP.md, section 2), or open app/index.html locally to see the SAMPLE office.")
+    print("4. In each agent's runbook, report with `gatherlane report --agent <id> ...` (examples/cron-and-sessions.md).")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -399,10 +534,19 @@ def main():
     u.add_argument("--runbook"); u.add_argument("--workflow"); u.add_argument("command", nargs=argparse.REMAINDER)
     v = sub.add_parser("validate"); v.add_argument("files", nargs="+")
     sub.add_parser("init-branch")
+    i = sub.add_parser("init", help="set up a new office")
+    i.add_argument("--repo", required=True, help="owner/repo that will hold the status branch")
+    i.add_argument("--agent", action="append", required=True, help="agent id, repeat for each agent")
+    i.add_argument("--watch", action="append", default=[], help="OWNER/REPO or OPERATION:OWNER/REPO whose PRs and runs to show")
+    i.add_argument("--maintainer", help="your name, shown in the supervisor office and on pause entries")
+    i.add_argument("--tz", help="IANA time zone, default GATHERLANE_TZ or UTC")
+    i.add_argument("--instance", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app", "instance"))
+    i.add_argument("--env-file", default=os.environ.get("GATHERLANE_ENV", "~/.config/gatherlane/env"))
+    i.add_argument("--force", action="store_true", help="replace an existing instance")
     a = ap.parse_args()
     load_env_file()
     {"report": cmd_report, "check-pause": cmd_check_pause, "run": cmd_run, "validate": cmd_validate,
-     "init-branch": cmd_init_branch}[a.cmd](a)
+     "init-branch": cmd_init_branch, "init": cmd_init}[a.cmd](a)
 
 
 if __name__ == "__main__":

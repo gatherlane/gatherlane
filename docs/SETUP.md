@@ -14,19 +14,30 @@ user or organisation that holds your Gatherlane repo.
    git push -u origin main
    ```
 
-2. Make the writer token and save it on the machine (step 4 explains the token). Then create the
-   status branch with the pause file:
+2. Make the writer token: a fine-grained token for `<owner>/gatherlane` only, with Contents: read
+   and write. Save it as `export GATHERLANE_TOKEN=...` in `~/.config/gatherlane/env` (`chmod 600`).
+
+3. Set up the office with `init`, naming your agents (`<operation>/<agent>`) and the repos whose
+   pull requests and workflow runs should reach the inbox:
 
    ```sh
-   . ~/.config/gatherlane/env && python3 tools/gatherlane.py init-branch
+   python3 tools/gatherlane.py init --repo <owner>/gatherlane \
+     --agent web/implementer --agent web/pr-reviewer --agent support/inbox \
+     --watch <owner>/web --watch support:<owner>/helpdesk \
+     --maintainer <your name> --tz Europe/Berlin
    ```
 
-   It prints `created branch status`, `created control/pause.json` and `ok`. The branch is made
-   from `main` and holds `control/pause.json` with `{"paused": {}}`. Status files live only on
-   `status`, so agent writes never touch `main` or trigger site builds.
+   It checks the token, creates the `status` branch with `control/pause.json`, writes
+   `app/instance/` (config, a generated building, SAMPLE data), registers each agent as
+   `not_deployed`, adds `GATHERLANE_REPO` and `GATHERLANE_TZ` to the env file (never the token),
+   and prints the label commands and the remaining steps. `--watch OWNER/REPO` attaches the repo
+   to the first operation that is not the shared den; `OPERATION:OWNER/REPO` picks one. It will not replace an existing
+   instance without `--force`. Status files live only on `status`, so agent writes never touch
+   `main` or trigger site builds.
 
-3. Point both halves at your repo: `GATHERLANE_REPO` in the env file (step 4) for the reporter,
-   and `statusRepo` in `app/instance/config.js` for the site.
+   Without `init`: `python3 tools/gatherlane.py init-branch` creates the branch, and you copy
+   `examples/instance/` to `app/instance/` and set `statusRepo` there and `GATHERLANE_REPO` in
+   the env file yourself.
 
 ## 2. Host it on Cloudflare Pages behind Cloudflare Access
 

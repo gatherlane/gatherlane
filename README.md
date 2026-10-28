@@ -47,8 +47,9 @@ Open `app/index.html` in a browser (sample mode), or serve the folder:
 python3 -m http.server -d app 8080
 ```
 
-To start your own office, replace `app/instance/` with a copy of `examples/instance/` and edit
-the three files there; `docs/SETUP.md` has the rest. Nothing outside `app/instance/` should name
+To start your own office, run `python3 tools/gatherlane.py init --repo <owner>/gatherlane --agent
+<operation>/<agent> ...`: it creates the status branch, writes `app/instance/` with a generated
+building and registers your agents. `docs/SETUP.md` has the rest. Nothing outside `app/instance/` should name
 your fleet: `tests/test_engine_is_generic.py` fails if it does.
 
 ## Controls

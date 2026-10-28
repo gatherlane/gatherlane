@@ -48,8 +48,10 @@ Goal: no hand-drawn layout. The biggest barrier today is `building.js`.
 - **Done.** Auto-layout: floors and rooms are built from `config.js` (an operation's `level` is its
   floor, an agent's `room` its room, desks in order). `building.js` stays as an optional override
   for people who want to arrange furniture.
-- `gatherlane init`: a reporter command that asks for the repo, creates the status branch and
-  labels, writes a starter `config.js`, and prints the Pages and token steps.
+- **Done.** `gatherlane init`: creates the status branch, writes a starter `app/instance/`,
+  registers the agents, adds the settings to the env file, and prints the label commands and the
+  Pages and token steps. Labels are printed rather than created, because the reporter's token
+  normally only reaches the status repo.
 - A config check in the app: Settings lists agents that report but are not in the config, and
   configured agents that never reported.
 

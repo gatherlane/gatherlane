@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Tests for tools/gatherlane.py: python3 -m unittest discover -s tests
 # Standard library only. The CLI tests run the reporter against tests/fake_github.py.
-import datetime as dt, importlib.util, json, os, socket, subprocess, sys, tempfile, time, unittest, urllib.request
+import datetime as dt, importlib.util, json, os, shutil, socket, subprocess, sys, tempfile, time, unittest, urllib.request
 from zoneinfo import ZoneInfo
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -99,6 +99,20 @@ class Cron(unittest.TestCase):
         self.assertIsNone(gl.next_run("not a cron"))
 
 
+class JavaScriptValues(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "needs node")
+    def test_any_string_round_trips(self):
+        v = {"a": "back\\slash", "b": "it's", "c": "</script><b>x", "d": "line\nbreak", "e": "tab\there",
+             "f": "\u2028sep", "g": 'say "hi"', "h-key": [1, None, True, {"x": "y"}],
+             "i": 'slash then quote \\"', "j": "slash then apostrophe \\'", "k": "\\\\'\""}
+        out = subprocess.run(["node", "-e", "console.log(JSON.stringify(" + gl.js(v) + "))"], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), v)
+
+    def test_single_quoted_like_the_example(self):
+        self.assertEqual(gl.js({"statusRepo": "o/r"}), "{\n  statusRepo: 'o/r',\n}")
+
+
 class Records(EnvCase):
     def test_valid_record(self):
         rec = gl.build_record(None, gl.ns(agent="acme/x", status="idle"))
@@ -133,8 +147,8 @@ def free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
 
-class CLI(unittest.TestCase):
-    """The reporter as an agent runs it, against a fake GitHub contents API."""
+class FakeServer(unittest.TestCase):
+    """Starts tests/fake_github.py for each test."""
     def setUp(self):
         self.port = free_port()
         self.srv = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests", "fake_github.py"), str(self.port)])
@@ -157,6 +171,9 @@ class CLI(unittest.TestCase):
                    GATHERLANE_TZ="UTC", GATHERLANE_ENV=os.devnull)
         return subprocess.run([sys.executable, TOOL, *args], env=env, capture_output=True, text=True)
 
+
+class CLI(FakeServer):
+    """The reporter as an agent runs it, against a fake GitHub contents API."""
     def test_check_pause(self):
         self.assertEqual(self.cli("check-pause", "--agent", "acme/social").returncode, 3)
         self.assertEqual(self.cli("check-pause", "--agent", "acme/other").returncode, 0)
@@ -220,6 +237,105 @@ class CLI(unittest.TestCase):
         marker = os.path.join(tempfile.mkdtemp(), "ran")
         self.assertEqual(self.cli("run", "--agent", "acme/social", "--", sys.executable, "-c", f"open({marker!r},'w')").returncode, 0)
         self.assertFalse(os.path.exists(marker))
+
+
+class Init(FakeServer):
+    """gatherlane init against the fake server, into a temporary instance and env file."""
+    def init(self, *args, token=True, env_text=None):
+        d = tempfile.mkdtemp()
+        inst, envf = os.path.join(d, "instance"), os.path.join(d, "env")
+        if env_text is not None:
+            with open(envf, "w") as f:
+                f.write(env_text)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GATHERLANE_")}
+        env.update(GATHERLANE_API=f"http://127.0.0.1:{self.port}", GATHERLANE_ENV=envf)
+        if token:
+            env["GATHERLANE_TOKEN"] = "t"
+        r = subprocess.run([sys.executable, TOOL, "init", "--instance", inst, "--env-file", envf, *args],
+                           env=env, capture_output=True, text=True)
+        return r, inst, envf
+
+    def test_without_token_writes_nothing(self):
+        r, inst, envf = self.init("--repo", "o/r", "--agent", "web/a", token=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("GATHERLANE_TOKEN is not set", r.stderr)
+        self.assertIn("Contents: read and write", r.stderr)  # says how to make one
+        self.assertFalse(os.path.exists(inst) or os.path.exists(envf))
+
+    def test_new_office(self):
+        r, inst, envf = self.init("--repo", "o/r", "--agent", "web/implementer", "--agent", "web/pr-reviewer",
+                                  "--agent", "orchestrator-1", "--watch", "o/app", "--maintainer", "robin",
+                                  "--tz", "Europe/Berlin", env_text="export GATHERLANE_TOKEN=t\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(sorted(os.listdir(inst)), ["building.js", "config.js", "sample.js"])
+        files = self.files()
+        for path in ("status/web/implementer.json", "status/web/pr-reviewer.json", "status/shared/orchestrator-1.json"):
+            self.assertEqual(files[path]["status"], "not_deployed", path)
+        with open(envf) as f:
+            text = f.read()
+        self.assertEqual(text, "export GATHERLANE_TOKEN=t\nexport GATHERLANE_REPO=o/r\nexport GATHERLANE_TZ=Europe/Berlin\n")
+        self.assertIn("gh label create review:approved -R o/app", r.stdout)
+        if shutil.which("node"):  # the written config loads, and the generated building places every agent
+            js = ("require(process.argv[1]); require(process.argv[2]); const C = GATHERLANE_CONFIG, L = Layout.fromConfig(C).LEVELS;"
+                  "console.log(JSON.stringify([C.statusRepo, C.timeZone, C.maintainer, C.operations.web.repos,"
+                  " L.map(l => [l.id, l.agents.map(a => a.id)])]))")
+            out = subprocess.run(["node", "-e", js, os.path.join(inst, "config.js"), os.path.join(ROOT, "app", "js", "layout.js")],
+                                 capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(json.loads(out.stdout), ["o/r", "Europe/Berlin", "robin", ["o/app"],
+                             [["den", ["orchestrator-1"]], ["web", ["web/implementer", "web/pr-reviewer"]], ["supervisor", ["robin"]]]])
+
+    def test_env_file_created_owner_only(self):
+        r, inst, envf = self.init("--repo", "o/r", "--agent", "web/a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(os.stat(envf).st_mode & 0o777, 0o600)
+        with open(envf) as f:
+            self.assertNotIn("TOKEN", f.read())
+
+    def test_watch_default_skips_the_den(self):
+        r, inst, _ = self.init("--repo", "o/r", "--agent", "orchestrator-1", "--agent", "web/a", "--watch", "o/app")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(inst, "config.js")) as f:
+            text = f.read()
+        self.assertIn("defaultLevel: 'web'", text)
+        self.assertRegex(text, r"web: \{\n\s+name: 'Web',\n\s+level: 'web',\n\s+repos: \['o/app'\]")
+
+    def test_creates_a_missing_status_branch(self):
+        d = tempfile.mkdtemp()
+        env = {**{k: v for k, v in os.environ.items() if not k.startswith("GATHERLANE_")},
+               "GATHERLANE_API": f"http://127.0.0.1:{self.port}", "GATHERLANE_TOKEN": "t", "GATHERLANE_BRANCH": "fresh"}
+        r = subprocess.run([sys.executable, TOOL, "init", "--repo", "o/r", "--agent", "web/a", "--instance", os.path.join(d, "i"),
+                            "--env-file", os.path.join(d, "env")], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("created branch fresh", r.stdout)
+        refs = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/refs").read())
+        self.assertEqual(refs.get("fresh"), refs["main"])
+
+    def test_existing_instance_needs_force(self):
+        r, inst, _ = self.init("--repo", "o/r", "--agent", "web/a")
+        with open(os.path.join(inst, "config.js")) as f:
+            before = f.read()
+        r2 = subprocess.run([sys.executable, TOOL, "init", "--repo", "o/r", "--agent", "web/b", "--instance", inst],
+                            env={**os.environ, "GATHERLANE_API": f"http://127.0.0.1:{self.port}", "GATHERLANE_TOKEN": "t",
+                                 "GATHERLANE_ENV": os.devnull}, capture_output=True, text=True)
+        self.assertNotEqual(r2.returncode, 0)
+        self.assertIn("--force", r2.stderr)
+        with open(os.path.join(inst, "config.js")) as f:
+            self.assertEqual(f.read(), before)
+
+    def test_registered_agent_is_left_alone(self):
+        self.cli("report", "--agent", "acme/social", "--status", "running", "--new")
+        r, _, _ = self.init("--repo", "o/r", "--agent", "acme/social")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("already has a status file", r.stdout)
+        self.assertEqual(self.files()["status/acme/social.json"]["status"], "running")
+
+    def test_bad_input(self):
+        for args in (["--repo", "o/r", "--agent", "Web/Bad Id"], ["--repo", "nope", "--agent", "web/a"],
+                     ["--repo", "o/r", "--agent", "web/a", "--watch", "ops:o/x"], ["--repo", "o/r", "--agent", "web/a", "--tz", "Mars/Base"]):
+            r, inst, _ = self.init(*args)
+            self.assertNotEqual(r.returncode, 0, args)
+            self.assertFalse(os.path.exists(inst), args)
 
 
 if __name__ == "__main__":
