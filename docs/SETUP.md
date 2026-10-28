@@ -79,7 +79,10 @@ expired token shows as errors in Settings → connections, not as fake data.
 
 In the app: ⚙ → paste each token → tick "Remember tokens on this device" only on your own
 devices → Save. The pill turns green (**LIVE**) and Settings lists every repo as ok or with its
-error code.
+error code. It also lists agents whose status files the app read but that are on no floor (add
+them to `agents` in `config.js`, or to `building.js` if you draw the building by hand), and agents
+on a floor with no status file yet (register one with
+`gatherlane report --agent <id> --new --status not_deployed`, or wait for its first run).
 
 **Optional: Run now.** "Run workflow" opens GitHub's dispatch page by default. To start runs from
 Gatherlane itself, add a separate token per owner with Actions: Read and write on the agent repos

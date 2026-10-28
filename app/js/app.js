@@ -63,22 +63,31 @@
   function loadSample() {
     Object.assign(D, { mode: 'sample', rows: SAMPLE.rows, control: SAMPLE.control, prs: SAMPLE.prs.map(p => ({ ...p, labels: [p.label] })), runs: [], statusErr: null, invalid: [], prErr: {}, runErr: {}, updated: null });
   }
-  let gh = null, lastRuns = 0, refreshing = false;
+  // A Save during a read replaces gh (also when it turns on sample data, the only way to), so that
+  // read is dropped when it returns, and a forced refresh asked for meanwhile runs once it has ended.
+  let gh = null, lastRuns = 0, refreshing = false, again = false;
   async function refresh(force) {
     if (useSampleNow()) { loadSample(); renderAll(); return; }
-    if (refreshing) return; refreshing = true;
-    gh = gh || new GLData.GitHub(tokens);
+    if (refreshing) { if (force) again = true; return; }
+    refreshing = true;
+    const g = gh = gh || new GLData.GitHub(tokens);
     D.mode = 'live';
     try {
-      const st = await GLData.loadStatus(gh, CFG);
-      Object.assign(D, { rows: st.rows, control: st.control, invalid: st.invalid, statusErr: null });
-    } catch (e) {
-      D.rows = []; D.control = { paused: {} }; D.statusErr = e.status === 404 ? `status branch “${CFG.statusBranch}” not found in ${CFG.statusRepo}, or the ${ownerOf(CFG.statusRepo)} token can't read it` : (e.status ? `${e.status} reading ${CFG.statusRepo}` : String(e.message));
+      let st;
+      try { st = await GLData.loadStatus(g, CFG); st.statusErr = null; } catch (e) {
+        st = { rows: [], control: { paused: {} }, invalid: D.invalid, statusErr: e.status === 404 ? `status branch “${CFG.statusBranch}” not found in ${CFG.statusRepo}, or the ${ownerOf(CFG.statusRepo)} token can't read it` : (e.status ? `${e.status} reading ${CFG.statusRepo}` : String(e.message)) };
+      }
+      const pr = await GLData.loadPRs(g, allRepos);
+      const runs = force || Date.now() - lastRuns > CFG.runsRefreshSeconds * 1000 ? await GLData.loadFailedRuns(g, allRepos) : null;
+      if (gh !== g) return;
+      Object.assign(D, { rows: st.rows, control: st.control, invalid: st.invalid, statusErr: st.statusErr, prs: pr.prs, prErr: pr.errors });
+      if (runs) { D.runs = runs.runs; D.runErr = runs.errors; lastRuns = Date.now(); }
+      D.updated = new Date().toISOString(); D.rate = g.rate;
+      renderAll();
+    } finally {
+      refreshing = false;
+      if (again) { again = false; refresh(true); }
     }
-    const pr = await GLData.loadPRs(gh, allRepos); D.prs = pr.prs; D.prErr = pr.errors;
-    if (force || Date.now() - lastRuns > CFG.runsRefreshSeconds * 1000) { const rr = await GLData.loadFailedRuns(gh, allRepos); D.runs = rr.runs; D.runErr = rr.errors; lastRuns = Date.now(); }
-    D.updated = new Date().toISOString(); D.rate = gh.rate; refreshing = false;
-    renderAll();
   }
 
   function statusIndex() { return Office.statusMap(D.rows, D.control, D.mode === 'sample' ? Date.parse(SAMPLE.now) : Date.now()); }
@@ -437,6 +446,15 @@
     for (const r of allRepos) { const e = D.prErr[r] || D.runErr[r]; rows.push(`<div><span>${esc(r)}</span><b style="color:${D.mode === 'sample' ? 'var(--muted)' : e ? 'var(--bad)' : 'var(--ok)'}">${D.mode === 'sample' ? '—' : e ? esc(String(e)) : 'ok'}</b></div>`); }
     if (D.invalid.length) rows.push(...D.invalid.map(i => `<div><span>${esc(i.path)}</span><b style="color:var(--bad)">invalid: ${esc(i.errs.join(', '))}</b></div>`));
     if (D.rate) rows.push(`<div><span>GitHub API requests left this hour</span><b>${D.rate.remaining}</b></div>`);
+    // sample rows are invented, so only a finished live read of the status files says who reports
+    const read = D.mode === 'live' && D.updated && !D.statusErr;
+    const chk = Layout.check(CFG, LEVELS, read ? D.rows.map(r => r.agent) : []);
+    const list = ids => ids.map(esc).join(', ');
+    rows.push(...chk.problems.map(p => `<div><span>config.js</span><b style="color:var(--bad)">${esc(p)}</b></div>`));
+    if (read) {
+      if (chk.unplaced.length) rows.push(`<div><span>Reporting, but on no floor (add to ${Building.generated ? 'config.js' : 'building.js'})</span><b style="color:var(--bad)">${list(chk.unplaced)}</b></div>`);
+      if (chk.silent.length) rows.push(`<div><span>On a floor, but no status file read</span><b style="color:var(--muted)">${list(chk.silent)}</b></div>`);
+    }
     $('conn').innerHTML = `<div class="conn">${rows.join('')}</div>`;
     $('settings').hidden = false;
   }
@@ -447,7 +465,7 @@
     prefs.remember = $('remember').checked; prefs.useSample = $('useSample').checked; ls.set('gl.prefs', prefs);
     ['gl.tokens', 'gl.dtokens'].forEach(k => { ls.del(k); ls.del(k, true); });
     ls.set('gl.tokens', nt, !prefs.remember); ls.set('gl.dtokens', nd, !prefs.remember);
-    tokens = nt; dtokens = nd; gh = null; lastRuns = 0;
+    tokens = nt; dtokens = nd; gh = null; lastRuns = 0; D.updated = null; // a read still in flight is dropped, so D.updated next comes from a read with these tokens
     $('settings').hidden = true; refresh(true);
   };
 
@@ -460,6 +478,8 @@
   tickClock(); setInterval(tickClock, 30000);
   if (useSampleNow()) loadSample(); else Object.assign(D, { mode: 'live', rows: [], prs: [], runs: [], control: { paused: {} } });
   renderAll(); fitView(); applyCam();
+  const cfgProblems = Layout.check(CFG, LEVELS, []).problems;
+  if (cfgProblems.length) { cfgProblems.forEach(p => console.warn('config.js:', p)); toast(`config.js has ${cfgProblems.length} problem${cfgProblems.length > 1 ? 's' : ''}; see Settings`); }
   refresh(true);
   setInterval(() => refresh(), CFG.refreshSeconds * 1000);
   setInterval(() => { if (D.updated) renderTop(); }, 60000);

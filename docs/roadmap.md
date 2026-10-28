@@ -52,8 +52,9 @@ Goal: no hand-drawn layout. The biggest barrier today is `building.js`.
   registers the agents, adds the settings to the env file, and prints the label commands and the
   Pages and token steps. Labels are printed rather than created, because the reporter's token
   normally only reaches the status repo.
-- A config check in the app: Settings lists agents that report but are not in the config, and
-  configured agents that never reported.
+- **Done.** A config check in the app: Settings lists agents that report but are on no floor, and
+  agents on a floor with no status file. It also flags a level named `supervisor` (reserved for
+  the maintainer's office) and more than nine numbered floors, with a notice when the app opens.
 
 Done means: a new user goes from clone to a live office with three agents in under ten minutes,
 timed with someone who has not seen the project.

@@ -2,7 +2,7 @@
 // Checks the generated building (app/js/layout.js): node tests/layout.test.js
 // Runs on the example config, this repository's instance config, and small edge cases.
 const assert = require('assert'), path = require('path'), fs = require('fs');
-const load = f => { delete globalThis.GATHERLANE_CONFIG; delete globalThis.Building; require(path.resolve(f)); return globalThis.GATHERLANE_CONFIG; };
+const load = f => { delete globalThis.GATHERLANE_CONFIG; delete globalThis.Building; delete require.cache[path.resolve(f)]; require(path.resolve(f)); return globalThis.GATHERLANE_CONFIG; };
 delete require.cache[require.resolve('../app/js/layout.js')];
 require('../app/js/layout.js');
 const { fromConfig, opOfId } = globalThis.Layout;
@@ -56,6 +56,65 @@ run('a look in config wins over the generated one', () => {
   const look = { species: 'owl', fur: '#000', outfit: '#fff', prop: 'book' };
   const [L] = check('look', { operations: { web: { level: 'web' } }, agents: { 'web/a': { look } } });
   assert.deepStrictEqual(L.agents[0].look, look);
+});
+
+run('config check: reporting agents off the map, configured agents with no status file', () => {
+  const cfg = { operations: { web: { level: 'web' } }, agents: { 'web/a': {}, 'web/b': {} }, maintainer: 'robin' };
+  const r = globalThis.Layout.check(cfg, fromConfig(cfg).LEVELS, ['web/a', 'web/ghost', 'ops/x']);
+  assert.deepStrictEqual(r, { problems: [], unplaced: ['ops/x', 'web/ghost'], silent: ['web/b'] });
+});
+run('config check: the maintainer is not an agent that should report', () => {
+  const cfg = { operations: { web: { level: 'web' } }, agents: { 'web/a': {} }, maintainer: 'robin' };
+  assert.deepStrictEqual(globalThis.Layout.check(cfg, fromConfig(cfg).LEVELS, ['web/a']), { problems: [], unplaced: [], silent: [] });
+});
+run('config check: decorative characters in a drawn building never report', () => {
+  const levels = [{ id: 'web', key: 1, agents: [{ id: 'web/a' }, { id: 'office-cat', decor: true }, { id: 'visitor', walker: true }, { id: 'robin', human: true }] }];
+  assert.deepStrictEqual(globalThis.Layout.check({ operations: {} }, levels, []), { problems: [], unplaced: [], silent: ['web/a'] });
+});
+run('config check: a level called supervisor is a problem', () => {
+  const cfg = { operations: { boss: { level: 'supervisor' } }, agents: { 'boss/a': {} } };
+  const { problems } = globalThis.Layout.check(cfg, fromConfig(cfg).LEVELS, []);
+  assert.strictEqual(problems.length, 1);
+  assert.match(problems[0], /“boss”.*supervisor/);
+});
+run('config check: an agent family called supervisor is a problem', () => {
+  const cfg = { operations: { web: { level: 'web' } }, agents: { 'web/a': {}, 'supervisor/x': {} }, maintainer: 'robin' };
+  const { problems } = globalThis.Layout.check(cfg, fromConfig(cfg).LEVELS, []);
+  assert.strictEqual(problems.length, 1);
+  assert.match(problems[0], /“supervisor”.*supervisor\/x/);
+});
+run('config check: a fallback operation called supervisor is a problem', () => {
+  const cfg = { fallbackOperation: 'supervisor', operations: { web: { level: 'web' } }, agents: { 'web/a': {}, solo: {} }, maintainer: 'robin' };
+  const { problems } = globalThis.Layout.check(cfg, fromConfig(cfg).LEVELS, []);
+  assert.strictEqual(problems.length, 1);
+  assert.match(problems[0], /“supervisor”.*solo/);
+});
+run('config check: a drawn supervisor office with the maintainer and a cat is fine', () => {
+  const levels = [{ id: 'web', key: 1, agents: [{ id: 'web/a' }] }, { id: 'supervisor', key: null, agents: [{ id: 'robin', human: true }, { id: 'cat', decor: true }] }];
+  assert.deepStrictEqual(globalThis.Layout.check({ operations: {} }, levels, []).problems, []);
+});
+run('config check: a character office.js shows a status on is not unplaced; the walker is', () => {
+  const cfg = { operations: { web: { level: 'web' } }, agents: { 'web/a': {} }, maintainer: 'robin' };
+  const levels = [...fromConfig(cfg).LEVELS, { id: 'den', key: null, agents: [{ id: 'office-cat', decor: true }, { id: 'visitor', walker: true }] }];
+  assert.deepStrictEqual(globalThis.Layout.check(cfg, levels, ['web/a', 'robin', 'office-cat', 'visitor']), { problems: [], unplaced: ['visitor'], silent: [] });
+});
+run('config check: more than nine keyed floors is a problem; nine is fine', () => {
+  const office = n => {
+    const operations = {}, agents = {};
+    for (let i = 0; i < n; i++) { operations['op' + i] = { level: 'f' + i }; agents[`op${i}/a`] = {}; }
+    return { operations, agents };
+  };
+  const nine = office(9), ten = office(10);
+  assert.deepStrictEqual(globalThis.Layout.check(nine, fromConfig(nine).LEVELS, []).problems, []);
+  const { problems } = globalThis.Layout.check(ten, fromConfig(ten).LEVELS, []);
+  assert.strictEqual(problems.length, 1);
+  assert.match(problems[0], /^10 floors/);
+});
+run('the example and instance configs pass the check', () => {
+  for (const f of ['examples/instance/config.js', 'app/instance/config.js'].filter(f => fs.existsSync(f))) {
+    const cfg = load(f);
+    assert.deepStrictEqual(globalThis.Layout.check(cfg, fromConfig(cfg).LEVELS, []).problems, [], f);
+  }
 });
 
 console.log(results.join('\n'));

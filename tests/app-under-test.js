@@ -7,10 +7,16 @@ function appUrl() {
   const app = path.resolve(__dirname, '../app');
   const inst = process.env.GATHERLANE_INSTANCE;
   if (!inst) return 'file://' + path.join(app, 'index.html');
+  return scratchApp(inst);
+}
+
+// A copy of app/ with the instance in <inst>; `extraConfig` is appended to its config.js.
+function scratchApp(inst, extraConfig = '') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gatherlane-app-'));
-  fs.cpSync(app, dir, { recursive: true });
+  fs.cpSync(path.resolve(__dirname, '../app'), dir, { recursive: true });
   fs.rmSync(path.join(dir, 'instance'), { recursive: true, force: true });
   fs.cpSync(path.resolve(inst), path.join(dir, 'instance'), { recursive: true });
+  if (extraConfig) fs.appendFileSync(path.join(dir, 'instance', 'config.js'), '\n' + extraConfig + '\n');
   return 'file://' + path.join(dir, 'index.html');
 }
 
@@ -42,4 +48,4 @@ function pathOf(id, inst) {
   return `status/${op}/${parts.length === 2 && parts[0] === op ? parts[1] : id.replace('/', '-')}.json`;
 }
 
-module.exports = { appUrl, readInstance, pathOf };
+module.exports = { appUrl, scratchApp, readInstance, pathOf };

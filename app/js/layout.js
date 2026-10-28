@@ -114,6 +114,29 @@
     };
   }
 
-  G.Layout = { fromConfig, opOfId, lookFor };
+  // What Settings lists about config.js, the building and the status files read. These are facts about
+  // files, never an agent status. `reported` is the agent ids that have a status file.
+  function check(cfg, levels, reported) {
+    const problems = [];
+    const reports = a => !a.human && !a.decor && !a.walker; // the characters expected to have a status file
+    // The maintainer's office holds only the maintainer and decoration. Any other floor with that id, from a
+    // declared operation, an agent prefix or fallbackOperation, cannot be walked on.
+    for (const L of levels.filter(L => L.id === 'supervisor')) {
+      const cast = L.agents.filter(reports);
+      if (!cast.length) continue;
+      const ops = [...new Set(cast.map(a => opOfId(cfg, a.id)))].map(k => `“${k}”`).join(', ');
+      problems.push(`operation ${ops} (${cast.map(a => a.id).join(', ')}) is on the level id “supervisor”, which is reserved for the maintainer's office`);
+    }
+    const keyed = levels.filter(L => L.key).length;
+    if (keyed > 9) problems.push(`${keyed} floors have number keys, but only 1 to 9 work; give some operations a shared level`);
+    // office.js shows a status file's status on any drawn character except the walker, so only an id it
+    // cannot show is unplaced; the maintainer and decoration are just not expected to report
+    const drawn = levels.flatMap(L => L.agents.filter(a => !a.walker).map(a => a.id));
+    const placed = levels.flatMap(L => L.agents.filter(reports).map(a => a.id));
+    const seen = new Set(reported);
+    return { problems, unplaced: [...seen].filter(id => !drawn.includes(id)).sort(), silent: placed.filter(id => !seen.has(id)).sort() };
+  }
+
+  G.Layout = { fromConfig, opOfId, lookFor, check };
   if (!G.Building && G.GATHERLANE_CONFIG) G.Building = fromConfig(G.GATHERLANE_CONFIG);
 })(typeof window !== 'undefined' ? window : globalThis);
