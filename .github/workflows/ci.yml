@@ -20,6 +20,22 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m unittest discover -s tests -v
 
+  # compose.yaml and deploy/nginx.conf: the container starts, goes healthy, and sends the headers
+  # in app/_headers. No image is built; the pinned nginx image is pulled.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config --quiet
+      - run: docker compose up -d --wait --wait-timeout 60
+      - run: python3 -m unittest tests.test_docker -v
+        env:
+          GATHERLANE_DOCKER_URL: http://127.0.0.1:8080
+      - if: always()
+        run: docker compose logs --no-log-prefix
+      - if: always()
+        run: docker compose down
+
   browser:
     runs-on: ubuntu-latest
     steps:

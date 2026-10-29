@@ -86,8 +86,11 @@ class Export(unittest.TestCase):
                 self.assertEqual(a.read(), b.read(), f)
         if os.environ.get(NESTED):
             return
+        # Without GATHERLANE_DOCKER_URL: a running container serves this checkout's app/, not the
+        # exported tree's, so test_docker there would probe the wrong mount.
+        env = {k: v for k, v in os.environ.items() if k != "GATHERLANE_DOCKER_URL"}
         r = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests"], cwd=first,
-                           capture_output=True, text=True, env=dict(os.environ, **{NESTED: "1"}))
+                           capture_output=True, text=True, env=dict(env, **{NESTED: "1"}))
         self.assertEqual(r.returncode, 0, "the exported tree's own suite fails:\n" + r.stderr[-3000:])
 
     def test_no_public_source_with_a_private_instance_ships_nothing(self):

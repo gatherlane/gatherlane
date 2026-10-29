@@ -63,6 +63,57 @@ to talk to `api.github.com`, and blocks framing.
 
 Nothing else runs on Cloudflare. The page is static, and your browser calls GitHub directly.
 
+## Run it on your own machine with Docker
+
+The other option to step 2, when the office only has to open on the machine it runs on. It needs
+Docker with Compose v2, and nothing on Cloudflare. In your clone:
+
+```sh
+docker compose up -d
+```
+
+then open <http://127.0.0.1:8080>. `compose.yaml` starts one nginx container that serves `app/`
+read-only, with the same headers `app/_headers` gives Pages, so the Content-Security-Policy still
+only lets the page talk to `api.github.com`. `docker compose ps` shows it as `healthy` once it
+answers.
+
+- **Tokens are per browser origin.** The browser keeps tokens for the address it loaded the page
+  from, so `http://127.0.0.1:8080` does not see tokens saved on your Pages domain, on
+  `localhost:8080`, or on another port. Paste them again in ⚙ Settings (step 3), and tick "Remember
+  tokens on this device" if you want them kept.
+- **Loopback only.** The port is published on `127.0.0.1`, never `0.0.0.0`. Nothing like
+  Cloudflare Access sits in front of it, so on `0.0.0.0` anyone on the same network could open
+  the office and read your fleet's names, repos and runbook links from `config.js`, and on Linux
+  Docker's published ports bypass a host firewall such as ufw. To use another port, set
+  `GATHERLANE_HTTP_PORT`, for example `GATHERLANE_HTTP_PORT=9090 docker compose up -d`; the address
+  stays `127.0.0.1`. To reach it from another device, use Pages and Access instead. Compose also
+  reads a `compose.override.yaml` next to `compose.yaml` on its own and adds its `ports` to this
+  one, so an override with `"0.0.0.0:9090:8080"` would publish the office on your network as
+  well. Do not keep one in the clone. `COMPOSE_FILE`, when set, replaces that default list
+  instead: the files it names are the only ones read, and a file listed after `compose.yaml`
+  adds its `ports` the same way. `docker compose config` shows the ports that will really be
+  published.
+- **Limits.** The container is capped at 0.25 CPU, 64 MiB of memory and 32 processes, with the
+  `docker stats` figures behind them in the comment at the top of `compose.yaml`. To change them,
+  edit `x-limits` there and run `docker compose up -d`.
+- **Logs and usage.** `docker compose logs -f` shows the access log (the healthcheck is left out)
+  and nginx errors, capped at 3 files of 10 MB. `docker stats` shows CPU, memory and processes
+  against the limits.
+- **Updating.** `git pull` is enough: `app/` is mounted, not copied, so reload the page and the
+  new version is there, with no rebuild. If the pull changed `compose.yaml` or
+  `deploy/nginx.conf`, run `docker compose up -d --force-recreate` as well.
+- **Stopping.** `docker compose down`. Until then it restarts with Docker.
+- **On Linux, `app/` must be readable by uid 101**, the user nginx runs as in the container. With a
+  restrictive umask (027 or 077) a fresh clone is not, and every page is a 404. Fix it with
+  `chmod -R a+rX app` in the clone. Docker Desktop on a Mac does not need this.
+
+The container runs as an unprivileged user with a read-only filesystem, no Linux capabilities
+and `no-new-privileges`. It does not serve `_headers` itself, dotfiles, directory listings, or any
+path with a character outside ASCII. The bind mount on a Mac ignores case, Unicode case folds
+included, so `/_HEADERS` and `/_header%C5%BF` (a long s) open `_headers` there: the first is
+refused by a case-insensitive rule, the second by the non-ASCII one, and no file in `app/` has a
+non-ASCII name.
+
 ## 3. Read-only tokens (entered in the app, never committed)
 
 Fine-grained tokens belong to one owner, so make one per owner whose repos you watch. GitHub →
@@ -193,9 +244,15 @@ cd /tmp/gl-status && python3 tools/gatherlane.py validate $(find control status 
 - **GitHub Actions schedules in quiet repos.** GitHub disables scheduled workflows in public repos
   after 60 days without activity. Re-enable them from the Actions tab if that happens.
 - **Tokens.** The writer token (agents) and your read tokens (browser) expire on the dates you set.
-- **Nothing else.** Gatherlane has no server, database or poller. While the page is open it
-  refreshes status and PR labels every 2 minutes and workflow runs every 5. Unchanged responses
-  return 304 and do not count against GitHub's 5,000 requests per hour.
+- **Docker, if you run it on your own machine.** The office is only there while Docker and the
+  container are running. On a Mac that means Docker Desktop, which starts at login only when
+  "Start Docker Desktop when you sign in" is on in its settings; the container then comes back
+  with Docker on its own (`restart: unless-stopped`). `docker compose ps` shows whether it is up
+  and `healthy`.
+- **Nothing else.** Beyond that container, if you chose it, Gatherlane has no server, database or
+  poller. While the page is open it refreshes status and PR labels every 2 minutes and workflow
+  runs every 5. Unchanged responses return 304 and do not count against GitHub's 5,000 requests
+  per hour.
 
 ## Adding or changing agents and repos
 
@@ -229,6 +286,11 @@ npm run test:layout    # the generated building: every agent placed once, in its
 npm run test:browser   # sample mode and mocked live mode, against app/instance
 npm run test:example   # the same two, against examples/instance
 ```
+
+`tests/test_docker.py` (part of `test:py`) fails if `deploy/nginx.conf` and `app/_headers` send
+different headers, and checks the resolved `compose.yaml` where Docker is installed. With the
+container running, `GATHERLANE_DOCKER_URL=http://127.0.0.1:8080 python3 -m unittest
+tests.test_docker` also checks what it actually serves; CI does this in its `docker` job.
 
 Screenshots land in `out/`. The browser tests read the floors, agents and repos from the instance
 under test, so they need no edits when the fleet changes, and they exit non-zero on any page error.

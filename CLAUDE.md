@@ -82,8 +82,9 @@ line, never commit one, and never write one into `app/instance/config.js`, which
 Refer to a credential by its variable name.
 
 Keep the page free of new network destinations. The content security policy in `app/_headers`
-allows `api.github.com` only, and a token must never travel anywhere else. Tests use
-`tests/fake_github.py` and never reach the real API.
+and `deploy/nginx.conf`, which `tests/test_docker.py` keeps identical, allows `api.github.com`
+only, and a token must never travel anywhere else. Tests use `tests/fake_github.py` and never
+reach the real API.
 
 ## House style
 

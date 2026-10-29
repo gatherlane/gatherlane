@@ -18,6 +18,7 @@ app/                 the site (deploy this folder)
     data.js          read-only GitHub client (status branch, PRs, runs, room panels)
     audio.js         procedural lo-fi and office sounds (off by default)
     app.js           views, controls, inbox, cards
+compose.yaml         run the office locally in Docker (nginx config in deploy/)
 tools/gatherlane.py  reporter: agents write their status with it and honour the pause flag
 schema/              JSON Schemas for status files and control/pause.json
 examples/instance/   a neutral example fleet to start your own instance from
@@ -46,6 +47,10 @@ Open `app/index.html` in a browser (sample mode), or serve the folder:
 ```sh
 python3 -m http.server -d app 8080
 ```
+
+To keep it running with the same headers as the hosted site, `docker compose up -d` serves it on
+<http://127.0.0.1:8080> from a locked-down nginx container (see "Run it on your own machine with
+Docker" in `docs/SETUP.md`).
 
 To start your own office, run `python3 tools/gatherlane.py init --repo <owner>/gatherlane --agent
 <operation>/<agent> ...`: it creates the status branch, writes `app/instance/` with a generated

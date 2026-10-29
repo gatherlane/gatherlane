@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+# Run the office on your own machine: `docker compose up -d`, then open http://127.0.0.1:8080
+# docs/SETUP.md ("Run it on your own machine with Docker") has the rest.
+#
+# One container, nginx, serving app/ as static files with the headers in app/_headers. app/ is
+# mounted read-only rather than copied into an image, so `git pull` updates the office with no
+# rebuild. There is no backend: the page still talks to api.github.com straight from your browser.
+#
+# This file sits at the root, not under deploy/, so that `docker compose up -d` in a fresh clone
+# needs no -f flag, and ./app below resolves against the clone itself. The nginx config it mounts
+# is in deploy/.
+
+name: gatherlane
+
+# Limits. Without a ceiling the container may take the whole Docker VM. Measured with `docker stats` on
+# this image, one nginx worker, Docker Desktop 29.8 on Apple silicon (2026-10-28):
+#
+#   idle                                   6.0 MiB (9.3 MiB just after start)   CPU 0%     PIDS 2
+#   the Playwright tests, through it       6.9 MiB peak                         CPU 1.2%   PIDS 2
+#   a 16-thread burst, ~2,000 requests/s   6.8 MiB peak                         CPU 25%    PIDS 2
+#
+# The burst is held at the CPU limit by design, and still served every request. 64M is about
+# seven times the highest memory reading, and 32 pids is room for the healthcheck and a shell.
+# Re-measure with `docker stats` before lowering any of them; change them here, then run
+# `docker compose up -d` to apply.
+x-limits: &limits
+  deploy:
+    resources:
+      limits: { cpus: "0.25", memory: 64M, pids: 32 }
+
+# json-file is unbounded by default: a crash loop writes until the disk fills. 10m x 3 caps the
+# container at 30 MiB of logs.
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# nginx here runs as an unprivileged user on a port above 1024, so it needs no capability at all,
+# and no-new-privileges blocks setuid escalation inside the container.
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  office:
+    # Pinned to an exact nginx and Alpine version, so the base never moves underneath you. The
+    # unprivileged build runs as uid 101 and listens on 8080, not 80. To update, change the tag,
+    # then `docker compose up -d` and check the healthcheck goes healthy.
+    image: nginxinc/nginx-unprivileged:1.30.6-alpine3.24
+    <<: [*limits, *logging, *hardening]
+    restart: unless-stopped
+    # The image's own unprivileged user, written down so that nothing can quietly run it as root.
+    user: "101:101"
+    # Run nginx directly. The image's entrypoint scripts exist to rewrite the config it ships
+    # with; this one is mounted read-only and complete, so there is nothing for them to do.
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    # Nothing in the image needs to be writable. nginx's pid file and temp files go to /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    ports:
+      # Loopback only, never 0.0.0.0. The page holds your GitHub tokens in the browser, and
+      # nothing else on your network should reach it. GATHERLANE_HTTP_PORT changes the host
+      # port; the address stays 127.0.0.1.
+      - "127.0.0.1:${GATHERLANE_HTTP_PORT:-8080}:8080"
+    volumes:
+      - ./app:/usr/share/nginx/html:ro
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      # Fetches a file only app/ has (the image ships its own index.html), so it fails if app/ is
+      # not mounted. The user agent keeps these requests out of the access log (see
+      # deploy/nginx.conf).
+      test: ["CMD", "wget", "-q", "-U", "gatherlane-healthcheck", "-O", "/dev/null", "http://127.0.0.1:8080/js/app.js"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+      start_interval: 1s
