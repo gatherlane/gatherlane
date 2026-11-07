@@ -45,8 +45,12 @@ decoration and say nothing about status.
 Open `app/index.html` in a browser (sample mode), or serve the folder:
 
 ```sh
-python3 -m http.server -d app 8080
+python3 -m http.server --bind 127.0.0.1 -d app 8080
 ```
+
+then open <http://127.0.0.1:8080>. `--bind 127.0.0.1` keeps it on your own machine: without it,
+`http.server` listens on every interface, and anyone on the same network can read
+`instance/config.js`.
 
 To keep it running with the same headers as the hosted site, `docker compose up -d` serves it on
 <http://127.0.0.1:8080> from a locked-down nginx container (see "Run it on your own machine with
@@ -64,7 +68,10 @@ your fleet: `tests/test_engine_is_generic.py` fails if it does.
 arrows walk inside a floor, Enter talks to the nearest agent · Esc closes a card, then backs out to
 the building. On a phone it collapses to the inbox and one floor at a time.
 
-See [docs/SETUP.md](docs/SETUP.md) for hosting and for wiring agents to report.
+See [docs/SETUP.md](docs/SETUP.md) for hosting and for wiring agents to report. On Cloudflare Pages
+or any other public host, the files in `app/instance/` (your repo names, agents and runbook links)
+are public unless the host is behind a sign-in such as Cloudflare Access, so set that up before
+the first deploy.
 
 ## Plans
 

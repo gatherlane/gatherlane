@@ -41,25 +41,179 @@ user or organisation that holds your Gatherlane repo.
 
 ## 2. Host it on Cloudflare Pages behind Cloudflare Access
 
-**Pages**
+Cloudflare Access is a precondition here, not an option. Pages serves everything in `app/` to
+anyone who can reach the address, and that includes `app/instance/`: `config.js` names every repo
+you watch, your agents and their owners, and your runbook links, and `building.js` and
+`sample.js` carry the same names. Live GitHub data is not exposed this way, because each viewer's
+browser fetches it with that viewer's own tokens, but the instance files are. So the steps below
+put Access in front of the project before the office is first deployed, and never let a custom
+domain serve the office before Access covers it. Do them in this order.
+
+Every deployment also has its own address, `<hash>.<project>.pages.dev`, which keeps serving that
+deployment's files, `app/instance/` included, after newer deployments replace it. Cloudflare
+documents these addresses for preview deployments
+([Preview deployments](https://developers.cloudflare.com/pages/configuration/preview-deployments/#preview-aliases));
+its docs do not say the same of production deployments, so this guide assumes they have one too
+and checks it. The Access application for `*.<project>.pages.dev` below is what covers these
+addresses, so keep it even though preview deployments are off.
+
+The Cloudflare steps follow Cloudflare's documentation as read on 2026-10-29. They have not been
+run end to end on a live account; where a step goes beyond those docs, it says so.
+
+**Pages, with a placeholder first**
 1. Cloudflare dashboard → Workers & Pages → Create → Pages → Connect to Git → choose
    `<owner>/gatherlane`. If it is not listed, give the Cloudflare Pages GitHub app access to that
    repo in the owner's settings.
-2. Production branch `main`. Framework preset: None. Build command: leave empty.
-   Build output directory: `app`.
-3. Settings → Builds → Branch control: set preview deployments to **None**, so the `status`
-   branch never builds.
-4. Optional custom domain, for example `office.example.com` (Custom domains → Set up).
+2. Production branch `main`. Framework preset: None. For now, do not build the office: set the
+   build command to `mkdir -p placeholder && echo ok > placeholder/index.html` and the build
+   output directory to `placeholder`. Creating the project deploys straight away, and this way
+   the first deployment holds one page that says `ok` and none of `app/instance/`. Note the
+   project's address, `<project>.pages.dev`. Keep this placeholder deployment: the custom domain
+   steps and "Is my office public right now?" roll production back to it.
+3. Settings → Builds & deployments: set preview deployments to **None**, so the `status` branch
+   never builds.
+
+**Access** (only your email can open it). These are Cloudflare's steps for putting Access on a
+`pages.dev` domain
+([Known issues: Enable Access on your `*.pages.dev` domain](https://developers.cloudflare.com/pages/platform/known-issues/#enable-access-on-your-pagesdev-domain)).
+1. Workers & Pages → your project → Settings → General → **Enable access policy**. This creates
+   an Access application for `*.<project>.pages.dev`, which covers the per-deployment addresses
+   but not `<project>.pages.dev` itself.
+2. Select **Manage** on that policy. In Zero Trust, under Access → Applications, select the
+   project's application → **Configure**. Under **Public hostname**, delete the `*` from the
+   **Subdomain** field and select **Save** (change the **Application name** if saving gives an
+   error). That application now covers `<project>.pages.dev`.
+3. Back in the project, Settings → General → **Enable access policy** again. Zero Trust now lists
+   two applications for the project, one for `<project>.pages.dev` and one for
+   `*.<project>.pages.dev`. Keep both.
+4. Open each application's policy and make sure it is Action Allow, Include Emails with your
+   address (or the people you choose), never Everyone, and never a Bypass action, which lets
+   anyone through without signing in. Cloudflare's docs say only that the policy
+   restricts viewing to your Cloudflare account, not exactly what it contains, so check it. For
+   identity, the default one-time PIN by email works; Google login is nicer on the phone.
+5. In a private window, open `https://<project>.pages.dev/`, then the placeholder's own address
+   (Deployments → the placeholder deployment → its `<hash>.<project>.pages.dev` address). Each
+   should give the Access sign-in, not the page that says `ok`. If either shows `ok`, stop: do
+   not deploy the office. Fix the Access applications (steps 1 to 4) and check again.
+
+**Then deploy the office**
+1. Settings → Builds & deployments → Build configuration: clear the build command and set the
+   build output directory to `app`.
+2. Push to `main` to deploy it (`git commit --allow-empty -m "Deploy" && git push` if there is
+   nothing new).
+3. In a private window, open `https://<project>.pages.dev/instance/config.js`, then the same path
+   on the new deployment's own `<hash>.<project>.pages.dev` address (Deployments → the latest
+   deployment). Each should give the Access sign-in, not the file. If you see the file, follow
+   "Is my office public right now?" below.
 
 `app/_headers` is picked up by Pages. It sets a Content-Security-Policy that only allows the page
 to talk to `api.github.com`, and blocks framing.
 
-**Access** (only your email can open it)
-1. Zero Trust → Access → Applications → Add → Self-hosted.
-2. Add both hostnames: your custom domain and `<project>.pages.dev` (the name Pages gave the
-   project). Also add `*.<project>.pages.dev` in case a preview ever gets built.
-3. Policy: Action Allow, Include → Emails → your address. Session duration 24 h or what you prefer.
-4. Identity: the default one-time PIN by email works. Google login is nicer on the phone.
+**Custom domain** (optional, for example `office.example.com`). Cloudflare cannot add a custom
+domain that already has an Access policy on it, because the certificate check needs
+`/.well-known/acme-challenge/` on that hostname to get through
+([Known issues: Custom Domains](https://developers.cloudflare.com/pages/platform/known-issues/#custom-domains)).
+So the domain is added while production serves the placeholder, and the office comes back only
+once Access covers the domain.
+1. Settings → Builds & deployments → Configure Production deployments: untick **Enable automatic
+   production branch deployments** and save, so no push puts the office back in production
+   halfway through
+   ([Branch deployment controls](https://developers.cloudflare.com/pages/configuration/branch-build-controls/)).
+2. Deployments → All deployments → the placeholder deployment → ⋯ → **Rollback to this
+   deployment**. Production changes to the placeholder at once
+   ([Rollbacks](https://developers.cloudflare.com/pages/configuration/rollbacks/)).
+3. Custom domains → **Set up a domain** → `office.example.com` → Continue, and finish the DNS step
+   it asks for
+   ([Custom domains](https://developers.cloudflare.com/pages/configuration/custom-domains/)). Wait
+   until Cloudflare shows the domain as active.
+4. Put the domain behind Access (Known issues, steps 10 to 13): Zero Trust → Access controls →
+   Applications → **Create new application** → **Self-hosted and private** → **Add public
+   hostname**. The Domain list offers the zones on your Cloudflare account, not hostnames, so for
+   `office.example.com` set Subdomain `office`, Domain `example.com`, and leave Path empty
+   ([Publish a self-hosted application](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/)).
+   Add a policy with Action Allow, Include Emails, your address, as above, then **Create**. If
+   `example.com` is not in the Domain list, its DNS is not a zone on this Cloudflare account (for
+   example, the domain's CNAME is at another DNS provider), and Access cannot cover the domain:
+   stop here and follow "If the domain cannot go behind Access" below. If the screen also offers
+   **Switch to custom input**, Cloudflare documents that option for Cloudflare for SaaS custom
+   hostnames and does not say whether it covers a Pages custom domain, so do not rely on it: step
+   5 is what shows whether the domain is covered.
+5. In a private window, open `https://office.example.com/`. You should get the Access sign-in, not
+   the page that says `ok`. If you see `ok`, stop: do not go on to step 6. Fix the domain's Access
+   application and check again, or follow "If the domain cannot go behind Access" below.
+6. Deployments → the latest office deployment → ⋯ → **Rollback to this deployment**, then tick
+   **Enable automatic production branch deployments** again and save.
+7. In a private window, open `https://office.example.com/instance/config.js`. You should get the
+   Access sign-in, not the file. If you see the file, stop and roll back to the placeholder at
+   once (steps 2 and 1: roll back, then untick automatic deployments), then fix the domain's
+   Access application and repeat from step 5, or follow "If the domain cannot go behind Access".
+
+**If the domain cannot go behind Access** (custom domain step 4 sent you here), production is
+still the placeholder and automatic production deployments are still off. Remove the domain the
+way Cloudflare documents
+([Custom domains: Delete a custom domain](https://developers.cloudflare.com/pages/configuration/custom-domains/#delete-a-custom-domain)):
+first delete the project's CNAME record for the domain in the DNS records where you created it,
+then in the project, Custom domains → ⋯ → **Remove domain**. Once Custom domains no longer lists
+it, roll forward: Deployments → the latest office deployment → ⋯ → **Rollback to this
+deployment**, then tick **Enable automatic production branch deployments** again and save. The
+office is then only on the `pages.dev` addresses, which Access covers. Do not roll forward while
+the project still lists a custom domain that has no Access application of its own.
+
+**Certificate renewal.** Cloudflare's Known issues tie Pages custom domains to Cloudflare for
+SaaS (Advanced Certificates "cannot be used with Cloudflare Pages due to Cloudflare for SaaS's
+certificate prioritization"). Cloudflare for SaaS custom hostname certificates last 90 days, can
+be renewed from 30 days before they expire, and are renewed automatically by HTTP validation
+([Cloudflare for SaaS: Renew](https://developers.cloudflare.com/cloudflare-for-platforms/cloudflare-for-saas/security/certificate-management/issue-and-validate/renew-certificates/)).
+Debugging Pages says HTTP validation cannot be completed when Access is in the way
+([Blocked HTTP validation](https://developers.cloudflare.com/pages/configuration/debugging-pages/#blocked-http-validation)),
+and the docs do not say whether a renewal is exempt. So the domain's certificate may fail to
+renew, about every 60 days. That fails closed: browsers show a certificate error for the domain,
+and nothing is exposed. Cloudflare's fix is to disable Access over the domain until it verifies.
+Never do that while the office is in production, because it publishes `config.js` on the domain.
+Instead, take the office out of production first and repeat the custom domain steps with the
+domain already added: steps 1 and 2 (pause automatic deployments, roll back to the placeholder),
+then delete only the domain's own Access application (not the two `pages.dev` ones), wait until
+Custom domains shows the domain as active again, and then steps 4 to 7. This has not been run on a
+live account.
+
+**Is my office public right now?** Open a private window, so no Access session is reused, and go
+to `https://<project>.pages.dev/instance/config.js`, then to the same path on each custom domain
+and on the latest deployment's own `<hash>.<project>.pages.dev` address (Deployments → the latest
+deployment). The Access sign-in means that address is protected. The text of `config.js`, with
+your repo names in it, means anyone can read it. If so:
+1. Take the office off the production addresses.
+   - If the project has the placeholder deployment: Deployments → the placeholder deployment → ⋯ →
+     **Rollback to this deployment**. It is instant, and undone the same way. Then untick
+     automatic production deployments, as in custom domain step 1, so the next push does not
+     bring the office back.
+   - If it has no placeholder deployment: set the build command and output directory as in
+     "Pages, with a placeholder first" step 2, and push to `main` while automatic production
+     deployments are still on (an empty commit is enough), because with them off the push does
+     not deploy. Wait for that deployment to finish, and check in a private window that each address where
+     you saw the file no longer shows it. Only then untick automatic production deployments.
+
+   Neither touches older deployments' own addresses, which still serve the office.
+2. Add Access as above, covering `<project>.pages.dev`, `*.<project>.pages.dev` and each custom
+   domain, and check every address again. If step 1 changed the build configuration, set it back
+   now, as in "Then deploy the office" step 1 (clear the build command, build output directory
+   `app`), or the next push replaces the office with the placeholder. Then roll forward
+   (Deployments → the latest office deployment → ⋯ → **Rollback to this deployment**) and tick
+   automatic production deployments back on.
+3. Only as a last resort, delete the project: Settings → Delete project. It cannot be undone.
+   Remove its custom domains first, CNAME record and then **Remove domain**, as above. Cloudflare
+   notes that a project with over 100 deployments may not delete from the dashboard; delete
+   deployments first with
+   `npx wrangler pages deployment delete <DEPLOYMENT_ID> --project-name <PROJECT_NAME>`
+   ([Known issues](https://developers.cloudflare.com/pages/platform/known-issues/#delete-a-project-with-a-high-number-of-deployments)).
+   A deployment that still has an alias needs `--force`, and the latest deployment of a branch
+   cannot be deleted
+   ([Preview deployments: Delete preview deployments](https://developers.cloudflare.com/pages/configuration/preview-deployments/#delete-preview-deployments)).
+   Then set it up again in the order above.
+
+Turning off builds alone leaves the last deployment online.
+
+A Docker or local office bound to `127.0.0.1` needs no Access: only your own machine can reach it.
+See "Run it on your own machine with Docker" below.
 
 Nothing else runs on Cloudflare. The page is static, and your browser calls GitHub directly.
 
