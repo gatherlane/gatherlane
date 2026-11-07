@@ -3,3 +3,9 @@ node_modules/
 __pycache__/
 out/
 .claude/worktrees/
+# Probe files the live Docker test (tests/test_docker.py) writes into app/ and deletes again. A run
+# killed mid-test leaves them behind. Every probe name is probe_tag() output, gatherlane-probe- and
+# then a digit, so a real file such as gatherlane-prober.js or gatherlane-probe-notes.js stays
+# trackable.
+/app/**/gatherlane-probe-[0-9]*
+/app/**/.gatherlane-probe-[0-9]*

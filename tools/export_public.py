@@ -16,11 +16,18 @@ these home-directory paths (PATHS):
     path (not after a letter, digit, underscore, dot or hyphen, so a URL path does not count).
   - Linux: home between slashes followed by a name, anywhere; and root between slashes where it
     starts a path, as above.
-  - Windows: a drive letter, a colon and Users with backslashes, in any letter case; and
-    USERPROFILE in cmd's percent form or PowerShell's env: form, braced or not, in any letter case.
-  - A tilde followed by a user name and a slash: another user's home.
+  - Windows: a drive letter, a colon and Users with backslashes or slashes, mixed or not, in any
+    letter case; and USERPROFILE in cmd's percent form or PowerShell's env: form, braced or not,
+    in any letter case.
+  - A tilde followed by a user name and a slash or a backslash: another user's home.
   - A path under the home directory: a tilde, HOME or braced HOME, bare or in double quotes, then
-    a slash and a name, unless it is one of the few PUBLIC_HOME allows with no /.. segment after it.
+    one or more slashes or backslashes (PowerShell takes either, and JSON or JS escaping doubles a
+    backslash) and a name, unless it is one of the few PUBLIC_HOME allows with no .. segment after
+    it. The separators inside a PUBLIC_HOME entry are slashes only, so the backslash form of
+    .config/gatherlane or Library/Caches/ms-playwright is flagged, on purpose (see PUBLIC_HOME).
+    A .. segment starts after a slash or a backslash and ends at any character that cannot
+    continue a name (anything but a letter, digit, underscore, dot or hyphen), so ..\\ and ..{
+    lead out as surely as ../ does, while ..x is a name.
 
 It also refuses every file Claude Code would
 load as instructions except the root CLAUDE.md: a CLAUDE.md below the root, a CLAUDE.local.md
@@ -53,18 +60,28 @@ PRIVATE = ("app/instance/", "growth/", "CLAUDE.md", ".claude/", PRIVATE_NAMES)
 PUBLIC_CLAUDE = "examples/public-CLAUDE.md"
 # Home-relative paths the public docs use on purpose: the reporter's env file and its suggested
 # clone, a log directory in a cron example, and the Playwright cache. Any other one is a leak,
-# and so is an allowed one with a /.. segment after it, which leads back out of it.
+# and so is an allowed one with a /.. segment after it, which leads back out of it. The slashes
+# inside an entry are literal on purpose, so the backslash form of a multi-segment entry (the env
+# file written with backslashes throughout) is flagged. Letting either separator in there would
+# also allow a slash home prefix followed by .config, a backslash and gatherlane, which on macOS
+# and Linux is one file with a backslash in its name, not the allowed path.
 PUBLIC_HOME = (r"\.config/gatherlane", "gatherlane", "logs", "Library/Caches/ms-playwright")
-_END = r"""(?=/|[\s'"`()<>]|$)"""                                                 # end of a path segment
-_ALLOWED = "(?:" + "|".join(PUBLIC_HOME) + r")(?![\w.-])(?![^\s'\"`()<>]*/\.\." + _END + ")"
-_HOME = "(?:~|\\$" + "HOME|\\$\\{" + "HOME\\}|\"\\$" + "HOME\"|\"\\$\\{" + "HOME\\}\")/"  # ~/, HOME bare, braced or quoted
+_SEP = r"[/\\]"                                                                   # PowerShell takes either
+# A .. segment: after a separator, and not followed by anything that could continue a name, so it
+# ends at a slash, a backslash, a brace, a quote, whitespace, the end of the line and so on.
+_DOTDOT = _SEP + r"\.\.(?![\w.-])"
+_ALLOWED = "(?:" + "|".join(PUBLIC_HOME) + r")(?![\w.-])(?![^\s'\"`()<>]*" + _DOTDOT + ")"
+# The home prefix: a tilde, HOME bare, braced or quoted, then one or more separators, so a doubled
+# slash, and a backslash doubled by JSON or JS escaping, count as surely as one slash does (the
+# Users rule below takes repeats as well).
+_HOME = "(?:~|\\$" + "HOME|\\$\\{" + "HOME\\}|\"\\$" + "HOME\"|\"\\$\\{" + "HOME\\}\")" + _SEP + "+"
 # Split so this file does not match itself.
 PATHS = re.compile("|".join([
     "/" + "Users/", r"/home/\w",                                                   # macOS, Linux
     r"(?<![\w.-])(?i:/" + "users/)", r"(?<![\w.-])/" + "root/",                     # the same, any case, starting a path; root's home
     r"(?<![\w/])" + _HOME + "(?!" + _ALLOWED + r")[\w.-]+",                        # home-relative
-    r"(?<![\w/~])~[A-Za-z_][\w.-]*/",                                              # a tilde and a user name: another user's home
-    r"(?i:[a-z]:\\+" + r"users\\+)", "(?i:%" + "USERPROFILE%)",                      # Windows
+    r"(?<![\w/~])~[A-Za-z_][\w.-]*" + _SEP,                                           # a tilde and a user name: another user's home
+    r"(?i:[a-z]:[\\/]+" + r"users[\\/]+)", "(?i:%" + "USERPROFILE%)",                      # Windows
     r"(?i:\$\{?env:" + "USERPROFILE)",                                              # PowerShell
 ]))
 PAIR = r"'([\w.-]+)/([\w.-]+)'"

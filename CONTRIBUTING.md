@@ -14,8 +14,12 @@ will not be merged, however nice it looks. Decoration (bobbing characters, lamps
 ## Layout
 
 - `app/js/` is the engine. It must work for any office and must not name any particular fleet.
-- `app/instance/` is one office: `config.js`, `building.js`, `sample.js`. In this repository it is
-  a copy of `examples/instance/`. Change the example there, and keep the two in step.
+- `app/instance/` is one office: `config.js`, `building.js`, `sample.js`. `examples/instance/` is
+  the neutral example office, and it is what `tools/export_public.py` puts in `app/instance/` of
+  the public repository. Where `app/instance/` is a copy of the example, as in the public
+  repository, change `examples/instance/` and keep the two in step. Where it holds an office of
+  its own, the export leaves it out, so a change meant for everyone must be made in
+  `examples/instance/`, whatever else it changes.
 - `tools/gatherlane.py` is the reporter. Standard library only, Python 3.9 or later.
 - `schema/` holds the JSON Schemas for status files and `control/pause.json`. A change to the
   status format needs a schema change, a reporter change and an app change in the same pull request.

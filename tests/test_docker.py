@@ -8,7 +8,7 @@
 # - Served fetches from a running container at GATHERLANE_DOCKER_URL (for example
 #   http://127.0.0.1:8080 after `docker compose up -d --wait`) and skips when that is unset.
 # Run: python3 -m unittest discover -s tests
-import json, os, re, shutil, subprocess, time, unittest, urllib.error, urllib.request
+import itertools, json, os, re, shutil, subprocess, sys, tempfile, time, unittest, urllib.error, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEADERS_FILE = os.path.join(ROOT, "app", "_headers")
@@ -17,6 +17,54 @@ URL = os.environ.get("GATHERLANE_DOCKER_URL", "").rstrip("/")
 # The location in deploy/nginx.conf that refuses any path with a byte outside ASCII, as the
 # tokenizer below reads it (quotes dropped, backslashes kept for PCRE).
 NON_ASCII_LOCATION = "location ~ [\\x80-\\xFF]"
+# The live tests below write probe files into this checkout's app/, the directory the container
+# serves, and delete them afterwards. .gitignore lists the names, because a run killed mid-test
+# leaves them behind (tests/test_gitignore.py checks every name probe_names can make).
+PROBE_PREFIX = "gatherlane-probe"
+_probe_count = itertools.count()
+
+
+def probe_tag():
+    """A probe name new on every call: the process id keeps two runs at once against one checkout
+    from writing, serving or deleting each other's files, the time in milliseconds keeps a run
+    from reusing a name Docker Desktop may still answer "no such file" for, a moment after the
+    previous run deleted it, and the count keeps two tests in one run apart."""
+    return "%s-%d-%d-%d" % (PROBE_PREFIX, os.getpid(), int(time.time() * 1000), next(_probe_count))
+
+
+def write_probe(path):
+    """Create one probe file. Mode x makes a name collision a loud FileExistsError, before the
+    caller records the path for cleanup, so a run never overwrites or deletes another run's file."""
+    with open(path, "x", encoding="utf-8") as f:
+        f.write("probe\n")
+
+
+# Appended to a probe's entry in the non-ASCII walk, so a leftover is not mistaken for a real file.
+PROBE_NOTE = (" (a Docker test probe: a live run of Served was killed, or is running now against this"
+              " checkout; delete it once no run is)")
+
+
+def non_ascii(name):
+    return any(ord(c) > 0x7F for c in name)
+
+
+def non_ascii_paths(top_dir):
+    """How many names are under top_dir, and every one of them with a non-ASCII byte, relative to
+    top_dir. Nothing is skipped: a probe is reported like any other file, with PROBE_NOTE."""
+    seen, bad = 0, []
+    for top, dirs, files in os.walk(top_dir):
+        for name in dirs + files:
+            seen += 1
+            if non_ascii(name):
+                rel = os.path.relpath(os.path.join(top, name), top_dir)
+                bad.append(rel + (PROBE_NOTE if re.match(r"\.?" + PROBE_PREFIX + "-[0-9]", name) else ""))
+    return seen, bad
+
+
+def probe_names(tag):
+    """Every file under app/ the live tests write for one tag, relative to app/."""
+    return {"plain": tag + ".txt", "non_ascii": tag + "-\u00e9.txt",
+            "dotfile": "." + tag, "nested_dotfile": "js/." + tag}
 
 
 def parse_headers_file(text):
@@ -126,19 +174,34 @@ class NginxHeaders(unittest.TestCase):
 
     def test_app_has_no_non_ascii_path(self):
         """The non-ASCII location refuses every such path, so a file with such a name under app/
-        would be silently unreachable. Fails on the first one, so the rule cannot hide a real file."""
-        def non_ascii(name):
-            return any(ord(c) > 0x7F for c in name)
+        would be silently unreachable. Fails on every one, probes included, so the rule cannot hide
+        a real file; a probe is named as one, so the failure says what to do about it."""
         self.assertTrue(non_ascii("_header\u017f"), "control: the check sees a non-ASCII name")
         self.assertFalse(non_ascii("_headers"), "control: the check passes an ASCII name")
-        seen, bad = 0, []
-        for top, dirs, files in os.walk(os.path.join(ROOT, "app")):
-            for name in dirs + files:
-                seen += 1
-                if non_ascii(name):
-                    bad.append(os.path.relpath(os.path.join(top, name), ROOT))
+        seen, bad = non_ascii_paths(os.path.join(ROOT, "app"))
         self.assertGreater(seen, 0, "control: app/ was walked")
         self.assertEqual(bad, [], "deploy/nginx.conf refuses non-ASCII paths, so these are never served")
+
+    def test_non_ascii_paths_names_a_probe(self):
+        """A probe left by a killed live run (or one a live run is using right now) still fails the
+        walk above, and its entry says so, while a real file with a probe-like name does not get the
+        probe note (the rule is .gitignore's: the prefix, a hyphen, then a digit). Control: an ASCII
+        probe is not reported at all."""
+        d = tempfile.mkdtemp()
+        try:
+            tag = probe_tag()
+            os.makedirs(os.path.join(d, "js"))
+            for name in (probe_names(tag)["non_ascii"], "js/caf\u00e9.js", "gatherlane-prober-\u00e9.js",
+                         "gatherlane-probe-notes-\u00e9.js", probe_names(tag)["plain"]):
+                with open(os.path.join(d, name), "x", encoding="utf-8") as f:
+                    f.write("x\n")
+            seen, bad = non_ascii_paths(d)
+            self.assertEqual(seen, 6)
+            self.assertEqual(sorted(bad), sorted([
+                probe_names(tag)["non_ascii"] + PROBE_NOTE, os.path.join("js", "caf\u00e9.js"),
+                "gatherlane-prober-\u00e9.js", "gatherlane-probe-notes-\u00e9.js"]))
+        finally:
+            shutil.rmtree(d)
 
     def test_no_version_and_no_ranges(self):
         """server_tokens off keeps the nginx version out of Server and error pages. max_ranges 0
@@ -156,6 +219,50 @@ class NginxHeaders(unittest.TestCase):
         self.assertNotEqual(text, read(NGINX_CONF), "control did not change the config")
         got = sorted((a[0], a[1]) for _, n, a in nginx_directives(text) if n == "add_header")
         self.assertNotEqual(got, sorted(self.rules["/*"]))
+
+
+class ProbeNames(unittest.TestCase):
+    """The live tests below write into the served app/, so their file names must differ between
+    two runs at once against one checkout, and between two tests in one run. Standard library
+    only, no container needed."""
+
+    def test_tags_differ_within_a_run(self):
+        tags = [probe_tag() for _ in range(3)]
+        self.assertEqual(len(set(tags)), 3, tags)
+        for tag in tags:
+            self.assertTrue(tag.startswith(PROBE_PREFIX + "-%d-" % os.getpid()), tag)
+
+    def test_tags_differ_between_runs_at_once(self):
+        """Another process started in the same millisecond still gets another name."""
+        code = ("import importlib.util, sys; s = importlib.util.spec_from_file_location('t', sys.argv[1]); "
+                "m = importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                "m.time.time = lambda: 1.0; print(m.probe_tag())")
+        here = os.path.abspath(__file__)
+        tags = [subprocess.run([sys.executable, "-I", "-c", code, here], capture_output=True, text=True,
+                               check=True).stdout.strip() for _ in range(2)]
+        self.assertTrue(all(t.startswith(PROBE_PREFIX + "-") for t in tags), tags)
+        self.assertNotEqual(tags[0], tags[1])
+
+    def test_a_collision_is_loud(self):
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, probe_tag() + ".txt")
+            write_probe(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("another run\n")
+            with self.assertRaises(FileExistsError):
+                write_probe(path)
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "another run\n", "the other run's file is left as it was")
+        finally:
+            shutil.rmtree(d)
+
+    def test_names_share_the_tag(self):
+        tag = probe_tag()
+        names = probe_names(tag)
+        self.assertEqual(len(set(names.values())), len(names), names)
+        for name in names.values():
+            self.assertIn(tag, os.path.basename(name))
 
 
 def docker_compose_available():
@@ -265,14 +372,13 @@ class Served(unittest.TestCase):
         """A file with a non-ASCII name that exists in app/ is refused, while the same file with an
         ASCII name is served, so the 404 comes from the non-ASCII rule and not from a missing file.
         A URI that is not valid UTF-8 is a 404 as well, not a 500. Needs app/ mounted from this
-        checkout, which compose.yaml does. The names are new on every run: Docker Desktop can keep
-        answering "no such file" for a moment after a file of the same name was deleted."""
-        made, tag = [], "gatherlane-probe-%d-%d" % (os.getpid(), int(time.time() * 1000))
+        checkout, which compose.yaml does. The names are new on every run (probe_tag)."""
+        made, tag = [], probe_tag()
+        names = probe_names(tag)
         try:
-            for name in (tag + ".txt", tag + "-\u00e9.txt"):
+            for name in (names["plain"], names["non_ascii"]):
                 path = os.path.join(ROOT, "app", name)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("probe\n")
+                write_probe(path)
                 made.append(path)
             self.assertEqual(self.get("/" + tag + ".txt")[0], 200, "control: the mount is live")
             for path in ("/" + tag + "-%C3%A9.txt", "/_header%FF", "/js/app%C5%BF.js"):
@@ -297,16 +403,16 @@ class Served(unittest.TestCase):
     def test_dotfiles_not_served(self):
         """A dotfile that exists in app/ is refused, while the same file without the dot is served,
         so the 404 comes from the dotfile rule and not from a missing file. Needs app/ mounted from
-        this checkout, which compose.yaml does."""
-        made = []
+        this checkout, which compose.yaml does. The names are new on every run (probe_tag), so two
+        runs at once against one checkout do not delete each other's files mid-test."""
+        made, names = [], probe_names(probe_tag())
         try:
-            for name in ("gatherlane-probe.txt", ".gatherlane-probe", "js/.gatherlane-probe"):
+            for name in (names["plain"], names["dotfile"], names["nested_dotfile"]):
                 path = os.path.join(ROOT, "app", name)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("probe\n")
+                write_probe(path)
                 made.append(path)
-            self.assertEqual(self.get("/gatherlane-probe.txt")[0], 200, "control: the mount is live")
-            for path in ("/.gatherlane-probe", "/js/.gatherlane-probe"):
+            self.assertEqual(self.get("/" + names["plain"])[0], 200, "control: the mount is live")
+            for path in ("/" + names["dotfile"], "/" + names["nested_dotfile"]):
                 status, headers = self.get(path)
                 self.assertEqual(status, 404, path)
                 self.assert_headers(headers, path)

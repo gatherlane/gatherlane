@@ -324,6 +324,65 @@ class Export(unittest.TestCase):
             f.write("\n".join(a + "/.." + e for e in ends) + "\n" + a + "/..x\n")
         self.assertEqual(ep.scan(["a.md"], d, set()), [f"a.md:{n}: {a}" for n in range(1, len(ends) + 1)])
 
+    def test_scan_backslash_and_other_separators(self):
+        """Windows takes a backslash where a slash goes, so a backslash is a separator too: after
+        the home prefix, after another user's name, around Users, and on either side of a ..
+        segment that leads out of an allowed path. A .. segment also ends at a brace (shell brace
+        expansion turns ..{/x,} into ../x). Line 1 is the known-positive control in the form the
+        scan already caught; the rest were all missed before. Lines 15 to 20 repeat the separator
+        after the home prefix, as JSON and JS escaping does to a backslash. Lines 21 and 22 are
+        flagged on purpose: the slashes inside a PUBLIC_HOME entry are literal (see PUBLIC_HOME),
+        and those are the two entries with a slash inside. Built at runtime so this file does not
+        trip the scan itself."""
+        t, b = "~", "\\"
+        dh, bh, qh = "$" + "HOME", "${" + "HOME}", '"$' + 'HOME"'
+        d = tempfile.mkdtemp()
+        lines = [t + "/logs/../napkin",                                    # 1: control, caught before
+                 t + "/logs/.." + b + "napkin",                            # 2: the case in the issue
+                 t + "/logs" + b + ".." + b + "napkin",                    # 3
+                 t + "/gatherlane" + b + "../napkin",                      # 4
+                 t + "/logs/.." + b,                                       # 5: .. then a backslash at the end
+                 t + "/gatherlane/..{/napkin,}",                           # 6: brace expansion
+                 t + b + "napkin" + b + "notes.md",                        # 7: PowerShell home forms
+                 dh + b + "napkin",                                        # 8
+                 bh + b + "napkin",                                        # 9
+                 qh + b + "napkin",                                        # 10
+                 t + b + "logs" + b + ".." + b + "napkin",                 # 11
+                 "cd " + t + "robin" + b + "notes",                        # 12: another user's home
+                 "C:" + b + "Users/bob",                                   # 13: mixed separators
+                 "c:/" + "users" + b + "bob",                              # 14
+                 '"' + t + b + b + "napkin" + b + b + 'notes.md"',         # 15: JSON or JS escaped
+                 '"' + dh + b + b + 'napkin"',                             # 16
+                 dh + "//napkin",                                          # 17: repeated separators
+                 t + "//napkin",                                           # 18
+                 t + "///napkin",                                          # 19
+                 t + "//logs//../napkin",                                  # 20
+                 t + b + ".config" + b + "gatherlane" + b + "env",         # 21: flagged on purpose
+                 t + b + "Library" + b + "Caches" + b + "ms-playwright" + b + "x",  # 22: likewise
+                 t + "/logs" + b + "agent.log",                            # 23..: allowed, or a name
+                 t + b + "logs" + b + "agent.log",
+                 t + "//logs/agent.log",
+                 t + "//gatherlane/env",
+                 t + b + b + "gatherlane" + b + b + "env",
+                 t + "//.config/gatherlane/env",
+                 t + "/gatherlane/..x" + b + "y",
+                 t + "/gatherlane" + b + "..x/y",
+                 "a" + b + t + "x and " + dh + " alone"]
+        with open(os.path.join(d, "a.md"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+        self.assertEqual(ep.scan(["a.md"], d, set()),
+                         ["a.md:1: " + t + "/logs", "a.md:2: " + t + "/logs", "a.md:3: " + t + "/logs",
+                          "a.md:4: " + t + "/gatherlane", "a.md:5: " + t + "/logs",
+                          "a.md:6: " + t + "/gatherlane", "a.md:7: " + t + b + "napkin",
+                          "a.md:8: " + dh + b + "napkin", "a.md:9: " + bh + b + "napkin",
+                          "a.md:10: " + qh + b + "napkin", "a.md:11: " + t + b + "logs",
+                          "a.md:12: " + t + "robin" + b, "a.md:13: C:" + b + "Users/",
+                          "a.md:14: c:/" + "users" + b, "a.md:15: " + t + b + b + "napkin",
+                          "a.md:16: " + dh + b + b + "napkin", "a.md:17: " + dh + "//napkin",
+                          "a.md:18: " + t + "//napkin", "a.md:19: " + t + "///napkin",
+                          "a.md:20: " + t + "//logs", "a.md:21: " + t + b + ".config",
+                          "a.md:22: " + t + b + "Library"])
+
     def test_names_reads_config(self):
         d = tempfile.mkdtemp()
         os.makedirs(os.path.join(d, "c"))
