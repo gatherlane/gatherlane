@@ -398,6 +398,7 @@ zone so the office shows times the way the agents report them.
 | n8n | Execute Command nodes, snippet in `examples/cron-and-sessions.md` |
 | Claude Code subagents (`.claude/agents/*.md`) | the "Gatherlane status" section in `examples/cron-and-sessions.md`, appended to each agent file |
 | Orchestrator sessions | report `running` at the start of a cycle and `idle` at the end, as `orchestrator-1`, `orchestrator-<n>` |
+| Memory between runs (optional) | Punk Records: the `punk-run` cron wrapper, the Claude Code plugin or its MCP tools, in [`examples/punk-records.md`](../examples/punk-records.md) |
 
 **Agents that are not running yet.** Mark them `not_deployed` once, so the office shows "not
 deployed" instead of "no data". `examples/cron-and-sessions.md` has a loop over every id in

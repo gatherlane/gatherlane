@@ -23,6 +23,7 @@ tools/gatherlane.py  reporter: agents write their status with it and honour the 
 schema/              JSON Schemas for status files and control/pause.json
 examples/instance/   a neutral example fleet to start your own instance from
 examples/            GitHub Actions workflow, cron, n8n and Claude Code snippets
+  punk-records.md    optional memory between runs with Punk Records
 tests/               reporter unit tests, Playwright smoke tests, the engine-is-generic check
 docs/SETUP.md        hosting, tokens, populating status, what must keep running
 ```
