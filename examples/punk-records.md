@@ -88,11 +88,21 @@ stuck=
 log() { echo "punk-run: $*" >&2; }
 
 # Stop a punk step that runs longer than $limit: timeout(1), gtimeout (coreutils on older
-# macOS), otherwise perl's alarm. With none of them the step runs without a limit.
+# macOS), otherwise perl. The perl branch runs the step in a process group of its own and stops
+# the whole group, so a git that punk started stops with it. With none of them the step runs
+# without a limit.
 limited() {
   if command -v timeout >/dev/null 2>&1; then timeout "$limit" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$limit" "$@"
-  elif command -v perl >/dev/null 2>&1; then perl -e 'alarm shift; exec @ARGV or exit 127' "$limit" "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e '
+      $t = shift; $p = fork; defined $p or exit 127;
+      if (!$p) { setpgrp(0, 0); exec @ARGV or exit 127 }
+      setpgrp($p, $p);
+      $SIG{$_} = sub { kill "TERM", -$p; exit 143 } for qw(HUP INT TERM);
+      $SIG{ALRM} = sub { kill "TERM", -$p; sleep 1; kill "KILL", -$p; exit 124 };
+      alarm $t; waitpid $p, 0;
+      exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$limit" "$@"
   else "$@"
   fi
 }
@@ -133,7 +143,7 @@ punk_step() {
   case $rc in
     0) return 0 ;;
     75) stuck=1; log "lock $lock busy for $wait_s s, skipped: $step" ;;
-    124|142) log "$step timed out after $limit s, stopped" ;;
+    124) log "$step timed out after $limit s, stopped" ;;
     *) log "$step failed (exit $rc), ignored" ;;
   esac
   return 1
@@ -206,9 +216,10 @@ without `punk`. The log line says which it was:
 **Only this agent's satellite.** The wrapper saves and restores the one satellite id it is given.
 The pull brings other hosts' commits into the store, but writes nothing into any project: another
 project gets them at its own agent's next restore. So no wrapper on the host saves or restores a
-project that is not its own. `punk sync`, `punk watch --sync`, `punk restore` or `punk save`
-without an id, and the plugin in section 4 (for the project its session runs in) do touch other
-projects, so keep them away from projects a cron agent owns while it may be running.
+project that is not its own. `punk sync`, `punk watch` without an id (it saves every satellite
+tracked here, and with `--sync-every` also pulls, pushes and restores them all), `punk restore` or
+`punk save` without an id, and the plugin in section 4 (for the project its session runs in) do
+touch other projects, so keep them away from projects a cron agent owns while it may be running.
 
 **Restore runs before the pause check.** In this wrapper `punk restore` runs before `run`, so it
 runs before `run`'s own pause check: a paused agent still gets its restore, but never a save,
@@ -219,18 +230,29 @@ project, so this is harmless, but it is not nothing. Phase 2 (`run --memory punk
 restore after the pause check.
 
 **Encrypted stores.** A store made with `punk encrypt` has no plain git remote, and `punk` 0.5.0
-has no command that moves one satellite through an encrypted remote: only `punk sync` (and the
-plugin's hooks) do, and `punk sync` saves and restores every satellite. So on an encrypted store
-the wrapper saves into the local store and logs that it kept the memory on this host. To share
-it, run `punk sync` yourself at a time when no agent on the host is running.
+has no one-shot command for cron that moves one satellite through an encrypted remote. `punk sync`
+moves the store, but saves and restores every satellite. `punk watch <id> --sync-every <seconds>`
+saves and restores only that satellite as it moves the store, but it is a watcher that runs until
+it is stopped, not a step that ends. The plugin's SessionEnd hook saves one project and moves the
+store, but it is built for Claude Code sessions (section 4) and also saves the global satellite
+when that is tracked. So on an encrypted store the wrapper saves into the local store and logs
+that it kept the memory on this host. To share it, run `punk sync` yourself at a time when no
+agent on the host is running.
 
 Two more things to know when reading the store's history. A run whose save was skipped leaves
 local edits behind: if the store's copy also changes before the next run, the next restore and
 save both report a conflict (`punk` exits 1, which the wrapper logs) until you look with
 `punk diff <id>` and settle it with `--force` on `save` (local wins) or `restore` (the store wins,
 local kept as `.punk-bak`). And when two hosts push at the same moment, the second push is
-refused and logged; that host's next run pulls and pushes again. The agent keeps running and
-reporting meanwhile; only its memory stops moving.
+refused and logged; for memory files under `records/`, which the store merges by keeping both
+sides' lines, that host's next run pulls and pushes again. A pull that stops on a conflict outside
+`records/` (for example two hosts changing the same `satellites/<id>.json`) is aborted, and
+logged again on every run, so memory stops moving between that host and the remote until you
+settle it by hand while no agent on the host is running: `punk git pull --rebase origin main`,
+fix the file it names, `punk git add <file>`, then `punk git rebase --continue` (repeat the last
+three if it stops again). `punk sync` stops on the same conflict the same way: it aborts the pull,
+exits 2 and asks for a fix by hand. The agent keeps running and reporting meanwhile; only its
+memory stops moving.
 
 **One punk step at a time.** `punk` has no store lock yet, so the wrapper takes one around each
 `punk` command: `flock -w 300` where `flock` exists, otherwise a `mkdir` lock at `$PUNK_LOCK.d`.
@@ -249,11 +271,12 @@ stays `running` about 5 minutes longer, until you remove it with `rmdir /tmp/pun
 (a reboot clears `/tmp` on most hosts).
 
 Each punk step is stopped after `PUNK_TIMEOUT` (60 s), with `timeout`, `gtimeout` or `perl`,
-whichever the host has first. A step stopped this way is logged and the run goes on. With none of
-the three on `PATH` there is no limit, and a `punk` that hangs on the network holds the lock, and
-the board's `running`, until it ends. The restore runs before `run` reports anything, and the
-save, pull and push run inside the `running` window, so each punk step can add up to
-`PUNK_TIMEOUT`, plus the lock wait, to the time a run takes.
+whichever the host has first, and a `git` that `punk` started is stopped with it. A step stopped
+this way is logged and the run goes on (the `perl` branch allows one more second for it to stop).
+With none of the three on `PATH` there is no limit, and a `punk` that hangs on the network holds
+the lock, and the board's `running`, until it ends. The restore runs before `run` reports
+anything, and the save, pull and push run inside the `running` window, so each punk step can add
+up to `PUNK_TIMEOUT`, plus the lock wait, to the time a run takes.
 
 ## 4. Claude Code subagents and orchestrators
 
