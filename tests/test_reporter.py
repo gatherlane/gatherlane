@@ -431,8 +431,8 @@ class RunMemoryPunk(FakeServer):
 
 class PunkProjects(EnvCase):
     def test_pairs_spaces_home_and_duplicates(self):
-        os.environ["GATHERLANE_PUNK_PROJECTS"] = " a/x = /srv/x ,b/y=~/y,broken,=z,c/z=/1,c/z=/2,d/w=/w,d/w=/w"
-        self.assertEqual(gl.punk_projects(), {"a/x": "/srv/x", "b/y": os.path.expanduser("~/y"), "c/z": None, "d/w": "/w"})
+        os.environ["GATHERLANE_PUNK_PROJECTS"] = " a/x = /srv/x ,b/y=~/gatherlane,broken,=z,c/z=/1,c/z=/2,d/w=/w,d/w=/w"
+        self.assertEqual(gl.punk_projects(), {"a/x": "/srv/x", "b/y": os.path.expanduser("~/gatherlane"), "c/z": None, "d/w": "/w"})
 
 
 class Init(FakeServer):
