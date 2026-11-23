@@ -66,8 +66,17 @@ the store records that name in `satellites/<satellite id>.json`:
 
   ```sh
   cd                                             # the store is .punk-records in the home folder
-  mv .punk-records .punk-records.aside           # or the PUNK_HOME folder, if you set one
+  mv .punk-records .punk-records.aside
   punk init --no-global <private store remote>   # clones A's store this time
+  punk track /srv/agents/web-app
+  ```
+
+  If B's store is at a custom `PUNK_HOME`, move that folder instead, with `PUNK_HOME` still set
+  so that `punk init` clones into the same place:
+
+  ```sh
+  mv "$PUNK_HOME" "$PUNK_HOME.aside"
+  punk init --no-global <private store remote>
   punk track /srv/agents/web-app
   ```
 
@@ -223,20 +232,58 @@ time when that agent is not running. `punk save --force <satellite>` keeps only 
 `punk restore --force <satellite>` keeps only the store's copy (the local one kept as
 `.punk-bak`); each drops the other side's lines. To keep both, take the store's copy, then add back
 the local lines it lacks, for each file `punk status` names (here `CLAUDE.md` of
-`github.com/acme/web`):
+`github.com/acme/web`). This is only for memory files that are plain lists of lines, one note per
+line:
 
 ```sh
-cd /srv/agents/web                                      # the project folder on this host
-punk restore --force github.com/acme/web                # keeps the local copy as CLAUDE.md.punk-bak
-grep -vxF -f CLAUDE.md CLAUDE.md.punk-bak >> CLAUDE.md  # add back this host's lines the store lacks
+cd /srv/agents/web                          # the project folder on this host
+punk restore --force github.com/acme/web    # keeps the local copy as CLAUDE.md.punk-bak
+{ [ -z "$(tail -c 1 CLAUDE.md)" ] || echo
+  grep -vxF -f CLAUDE.md CLAUDE.md.punk-bak || [ $? -eq 1 ]
+} >> CLAUDE.md
 rm CLAUDE.md.punk-bak
 ```
 
 The next `session end` saves the file with both sides' lines and pushes it, and the runs after it
-exit 0. This suits memory files that are lists of lines, as most are. The local lines land at the
-end of the file, so where order matters, edit the file by hand from the `.punk-bak` copy before
-you delete it. Two hosts adding lines to the same memory file, once they share a store, are not a
-conflict: the store merges them and keeps both sides' lines.
+exit 0. The three lines in braces end the store copy with a newline if it lacks one, then add
+back the local lines it lacks. Each part is there for a reason:
+
+- Without the `tail -c 1` test, a store copy whose last line has no final newline is glued to the
+  first local line (`- last line from a- note from b`), on this host, on the remote and then on
+  every host, and every later run still exits 0, so nothing flags it.
+- `-x` compares whole lines. Without it, a local line such as `- shared line, plus port 8080` is
+  dropped because it contains the store's `- shared line`.
+- grep exits 1 when there is nothing to add. `|| [ $? -eq 1 ]` turns only that into success, so
+  the `rm` still runs in a script with `set -e`, while a real grep error (exit 2, for example no
+  `.punk-bak` copy) still stops it.
+
+The grep keeps a local line only when no line anywhere in the store copy is the same, so it gets
+three things wrong:
+
+- A local line that matches any line already in the store copy is dropped, even one repeated on
+  purpose: a blank line, a code fence, a heading.
+- A line edited on one side is kept in both versions: the file ends up saying both `- use node 18`
+  and `- use node 20`.
+- The local lines land at the end of the file, away from the heading they were under.
+
+For example, with a store copy holding one fenced block (`make`) and a local copy that added a
+blank line and a second fenced block (`make deploy`), the block runs, exits 0 and leaves this,
+with `make deploy` outside any fence, because both fence lines are already in the store copy:
+
+````text
+```sh
+make
+```
+
+make deploy
+````
+
+So unless the file is a plain list, and always when it has fenced blocks, headings or content in an
+order that matters, do not run the lines in braces. Run `punk restore --force`, then edit
+`CLAUDE.md` by hand from the `.punk-bak` copy, and delete the copy when you are done. Either way,
+read the file over before the next `session end` saves it. Two hosts adding lines to the same memory
+file, once they share a store, are not a conflict: the store merges them and keeps both sides'
+lines.
 
 ## 4. Claude Code subagents and orchestrators
 
