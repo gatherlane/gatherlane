@@ -15,10 +15,12 @@ Environment (each may also be set as `export NAME=value` in the env file, see GA
   GATHERLANE_PUNK_PROJECTS
                      for `run --memory punk`: each agent's project directory, as comma separated
                      ID=DIR pairs, e.g. "acme/web=/srv/agents/web,acme/api=/srv/agents/api".
-                     DIR must be an absolute path (a leading ~ is expanded) and contain no comma.
+                     DIR must be an absolute path (a leading ~ is expanded). Project folders may
+                     not contain commas.
   GATHERLANE_PUNK_TIMEOUT
-                     seconds each `punk session` step may take with --memory punk, default 120.
-                     A step that takes longer is stopped and counts as a punk failure.
+                     seconds each `punk session` step may take with --memory punk, default 120,
+                     at most 3600 (a larger value logs one line and uses 3600). A step that takes
+                     longer is stopped and counts as a punk failure.
   GATHERLANE_PUNK_SKIP_ON_START_FAILURE
                      1: with --memory punk, skip the command when `punk session start` fails, and
                      report blocked with last_result skipped. Otherwise the command runs anyway.
@@ -357,12 +359,14 @@ def punk_project(agent):
     return dirs[agent]
 
 
-PUNK_TIMEOUT = 120    # seconds per punk step unless GATHERLANE_PUNK_TIMEOUT says otherwise
-PUNK_KILL_GRACE = 5   # seconds between SIGTERM and SIGKILL for a step that ran out of time
+PUNK_TIMEOUT = 120      # seconds per punk step unless GATHERLANE_PUNK_TIMEOUT says otherwise
+PUNK_TIMEOUT_MAX = 3600  # the most GATHERLANE_PUNK_TIMEOUT may give
+PUNK_KILL_GRACE = 5     # seconds between SIGTERM and SIGKILL for a step that ran out of time
 
 
 def punk_timeout():
-    """GATHERLANE_PUNK_TIMEOUT in seconds. Anything but a positive finite number logs one line and gives the default."""
+    """GATHERLANE_PUNK_TIMEOUT in seconds. Anything but a positive finite number logs one line and gives the default;
+    more than PUNK_TIMEOUT_MAX logs one line and gives PUNK_TIMEOUT_MAX."""
     raw = env("GATHERLANE_PUNK_TIMEOUT")
     if raw is None:
         return PUNK_TIMEOUT
@@ -373,6 +377,9 @@ def punk_timeout():
     if t is None or not 0 < t < float("inf"):  # nan fails both comparisons
         log(f"--memory punk: GATHERLANE_PUNK_TIMEOUT={raw!r} is not a positive number of seconds; using {PUNK_TIMEOUT}")
         return PUNK_TIMEOUT
+    if t > PUNK_TIMEOUT_MAX:
+        log(f"--memory punk: GATHERLANE_PUNK_TIMEOUT={raw!r} is more than {PUNK_TIMEOUT_MAX} seconds; using {PUNK_TIMEOUT_MAX}")
+        return PUNK_TIMEOUT_MAX
     return t
 
 
@@ -402,40 +409,64 @@ class PunkSignal(BaseException):
     """SIGTERM or SIGHUP arrived while a punk step ran (see punk_guard)."""
 
 
+class PunkGuard:
+    """What punk_guard knows: punk once it has started (`p`), the first signal (`got`), and whether punk is being
+    stopped (`stopping`), after which no signal raises."""
+    def __init__(self):
+        self.p, self.got, self.stopping = None, [], False
+
+    def on_signal(self, signum, frame):
+        if self.got:  # a second signal: the first one decides, and the stop it started goes on
+            return
+        self.got.append(signum)
+        if self.p is not None and not self.stopping:  # before punk has started, started() raises instead
+            self.interrupt()
+
+    def interrupt(self):
+        raise KeyboardInterrupt if self.got[0] == signal.SIGINT else PunkSignal(self.got[0])
+
+    def started(self, p):
+        self.p = p
+        if self.got:  # a signal came while Popen was still starting punk
+            self.interrupt()
+
+    def stop(self):
+        self.stopping = True
+        punk_stop(self.p)
+
+
 @contextlib.contextmanager
-def punk_guard(p):
-    """Around a running punk step: if anything interrupts it (Ctrl-C, or SIGTERM or SIGHUP, which raise
-    PunkSignal here), stop punk's process group first, since punk has its own and a signal to the group
-    of `run` never reaches it. After a SIGTERM or SIGHUP `run` then ends by that same signal. A signal
-    whose handler is not the default (nohup's ignored SIGHUP, say) is left alone, and a second signal
-    while punk is being stopped does not cut that short."""
-    got, prev = [], {}
-
-    def on_signal(signum, frame):
-        if not got:
-            got.append(signum)
-            raise PunkSignal(signum)
-
-    for name in ("SIGTERM", "SIGHUP"):
+def punk_guard():
+    """Around a punk step, from before punk starts: if anything interrupts it (Ctrl-C, or SIGTERM or SIGHUP,
+    which raise PunkSignal here), stop punk's process group first, since punk has its own and a signal to the
+    group of `run` never reaches it. Then `run` ends by the first signal: by SIGTERM or SIGHUP itself, or by
+    KeyboardInterrupt for SIGINT, as before. A signal whose handler is not the default (nohup's ignored SIGHUP,
+    say) is left alone. Once punk is being stopped, for a signal or for the time limit, a further SIGTERM, SIGHUP
+    or SIGINT does not cut that stop short: the first one is kept and acted on once punk is stopped."""
+    g, prev = PunkGuard(), {}
+    for name, default in (("SIGTERM", signal.SIG_DFL), ("SIGHUP", signal.SIG_DFL), ("SIGINT", signal.default_int_handler)):
         sig = getattr(signal, name, None)
         try:
-            if sig is not None and signal.getsignal(sig) == signal.SIG_DFL:
-                prev[sig] = signal.signal(sig, on_signal)
+            if sig is not None and signal.getsignal(sig) == default:
+                prev[sig] = signal.signal(sig, g.on_signal)
         except ValueError:  # not the main thread: no handlers, as before
             pass
     try:
         try:
-            yield
+            yield g
         except BaseException:
-            punk_stop(p)
-            if not got:
+            if g.p is not None:
+                g.stop()
+            if not g.got:
                 raise
     finally:
         for sig, handler in prev.items():
             signal.signal(sig, handler)
-    if got:  # punk is stopped: end the way the signal would have ended `run`
-        os.kill(os.getpid(), got[0])
-        sys.exit(128 + got[0])  # only reached if the signal did not end the process
+    if g.got:  # punk is stopped: end the way the signal would have ended `run`
+        if g.got[0] == signal.SIGINT:  # Ctrl-C: as without the guard
+            raise KeyboardInterrupt
+        os.kill(os.getpid(), g.got[0])
+        sys.exit(128 + g.got[0])  # only reached if the signal did not end the process
 
 
 def punk_session(step, agent, project, timeout, quiet=False):
@@ -443,17 +474,18 @@ def punk_session(step, agent, project, timeout, quiet=False):
     when punk exited 0, otherwise what happened ("failed (exit 1)", "timed out after ..."), which is
     logged in one line unless `quiet`. Never raises for a punk problem."""
     penv = {k: v for k, v in os.environ.items() if k != "GATHERLANE_TOKEN"}  # punk has no use for the writer token
-    try:
-        p = subprocess.Popen(["punk", "--agent", agent, "session", step, "--project", project], env=penv,
-                             stdin=subprocess.DEVNULL, start_new_session=True)
-    except OSError as e:
-        what = f"could not start ({e})"
-    else:
-        with punk_guard(p):
+    with punk_guard() as g:  # the handlers go in before Popen, so no signal lands between punk starting and them
+        try:
+            p = subprocess.Popen(["punk", "--agent", agent, "session", step, "--project", project], env=penv,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            what = f"could not start ({e})"
+        else:
+            g.started(p)
             try:
                 rc = p.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                punk_stop(p)
+                g.stop()
                 what = f"timed out after {timeout:g} seconds and was stopped"
             else:
                 what = (None if rc == 0 else "needs a person (exit 2)" if rc == 2 else

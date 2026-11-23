@@ -325,10 +325,11 @@ class RunMemoryPunk(FakeServer):
         argv, extra = self.run_args(*args, **kw)
         return self.cli(*argv, extra=extra, input=input, timeout=timeout)
 
-    def run_and_signal(self, sig, when, ignore=None, again=None, **kw):
-        """Start `run` as the leader of its own process group, wait until `when(calls)` holds, then signal that
-        group, the way GNU timeout, `kill -TERM -<pgid>` or a job supervisor does, and once more `again` seconds
-        later if given. Returns (returncode, stderr)."""
+    def run_and_signal(self, sig, when, ignore=None, again=None, again_sig=None, delay=0, to_pid=False, **kw):
+        """Start `run` as the leader of its own process group, wait until `when(calls)` holds and `delay` seconds
+        more, then signal that group, the way GNU timeout, `kill -TERM -<pgid>` or a job supervisor does (or `run`
+        alone with `to_pid`), and once more `again` seconds later if given, with `again_sig` if given. Returns
+        (returncode, stderr), and sets self.stop_took to the seconds from the first signal to the end of `run`."""
         argv, extra = self.run_args(**kw)
         argv = [TOOL, *argv]
         if ignore:  # start `run` with `ignore` already ignored, as nohup does for SIGHUP
@@ -344,14 +345,18 @@ class RunMemoryPunk(FakeServer):
             self.assertIsNone(run.poll(), "run ended before the signal")
             self.assertLess(time.monotonic(), end, "run never reached the point to signal")
             time.sleep(.05)
-        os.killpg(run.pid, sig)
+        time.sleep(delay)
+        send = os.kill if to_pid else os.killpg
+        t0 = time.monotonic()
+        send(run.pid, sig)
         if again:
             time.sleep(again)
-            os.killpg(run.pid, sig)
+            send(run.pid, again_sig or sig)
         try:
             run.wait(timeout=30)
         except subprocess.TimeoutExpired:
             self.fail(f"run still runs 30 s after signal {sig}")
+        self.stop_took = time.monotonic() - t0
         with open(errf) as f:
             return run.returncode, f.read()
 
@@ -634,6 +639,104 @@ class RunMemoryPunk(FakeServer):
         self.assertFalse(alive(p["child"]), "the child of punk outlived two SIGTERMs to run")
 
     @unittest.skipUnless(hasattr(os, "killpg"), "process groups")
+    def test_any_second_signal_does_not_cut_the_stop_short(self):
+        # punk and its child ignore SIGTERM, so the stop takes the whole grace and then SIGKILL. A second TERM, HUP
+        # or INT 1 s into that grace must not end it early (git keeps its window to drop its locks), and run ends
+        # by the first signal, never by an exit code of its own
+        hung = lambda calls: any("child" in c for c in calls)
+        for first, second in ((signal.SIGTERM, signal.SIGINT), (signal.SIGINT, signal.SIGTERM),
+                              (signal.SIGINT, signal.SIGINT), (signal.SIGHUP, signal.SIGINT), (signal.SIGTERM, signal.SIGHUP)):
+            with self.subTest(first=first.name, second=second.name):
+                os.path.exists(self.log) and os.unlink(self.log)
+                self.cli("report", "--agent", "acme/job", "--status", "idle")
+                rc, err = self.run_and_signal(first, hung, again=1, again_sig=second, FAKE_PUNK_END="hang-ignore-term",
+                                              GATHERLANE_PUNK_TIMEOUT="60")
+                self.assertEqual(rc, -first, err)
+                self.assertGreater(self.stop_took, gl.PUNK_KILL_GRACE, err)  # the grace held after the second signal
+                self.assertLess(self.stop_took, 20)
+                self.assertNotIn("PunkSignal:", err)  # never ended by the exception instead of the signal
+                if first != signal.SIGINT:
+                    self.assertNotIn("Traceback", err)
+                p = self.calls()[-1]
+                self.assertFalse(alive(p["pid"]), f"punk outlived {first.name} then {second.name} to run")
+                self.assertFalse(alive(p["child"]), f"the child of punk outlived {first.name} then {second.name} to run")
+                self.assertEqual(self.status()["status"], "running")
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups")
+    def test_a_signal_in_the_grace_after_a_timeout_does_not_cut_it_short(self):
+        # the step times out at 1 s and run starts the grace; a SIGTERM (or Ctrl-C) about 1 s into it lets the
+        # grace run out, and then run ends by that signal rather than going on
+        hung = lambda calls: any("child" in c for c in calls)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(sig=sig.name):
+                os.path.exists(self.log) and os.unlink(self.log)
+                self.cli("report", "--agent", "acme/job", "--status", "idle")
+                rc, err = self.run_and_signal(sig, hung, delay=2, FAKE_PUNK_END="hang-ignore-term",
+                                              GATHERLANE_PUNK_TIMEOUT="1")
+                self.assertEqual(rc, -sig, err)
+                # the grace began at about 1 s and the signal came at about 2 s, so the rest of the grace still ran
+                self.assertGreater(self.stop_took, gl.PUNK_KILL_GRACE - 2, err)
+                self.assertLess(self.stop_took, 20)
+                self.assertNotIn("PunkSignal:", err)
+                if sig != signal.SIGINT:
+                    self.assertNotIn("Traceback", err)
+                p = self.calls()[-1]
+                self.assertFalse(alive(p["pid"]), f"punk outlived the timeout and a {sig.name} to run")
+                self.assertFalse(alive(p["child"]), f"the child of punk outlived the timeout and a {sig.name} to run")
+                self.assertEqual(self.status()["status"], "running")
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups")
+    def test_sigterm_to_the_run_pid_alone_stops_punk(self):
+        # `kill -TERM <pid of run>`, not its group: the same as a group signal
+        hung = lambda calls: any("child" in c for c in calls)
+        for step in ("START", "END"):
+            with self.subTest(step=step):
+                os.path.exists(self.log) and os.unlink(self.log)
+                self.cli("report", "--agent", "acme/job", "--status", "idle")
+                rc, err = self.run_and_signal(signal.SIGTERM, hung, to_pid=True, code="raise SystemExit(5)",
+                                              GATHERLANE_PUNK_TIMEOUT="60", **{"FAKE_PUNK_" + step: "hang"})
+                self.assertEqual(rc, -signal.SIGTERM, err)
+                p = [c for c in self.calls() if "child" in c][0]
+                self.assertFalse(alive(p["pid"]), f"punk session {step.lower()} outlived SIGTERM to the pid of run")
+                self.assertFalse(alive(p["child"]), "the child of punk outlived SIGTERM to the pid of run")
+                self.assertEqual(self.steps(), ["start"] if step == "START" else ["start", "agent", "end"])
+                self.assertEqual(self.status()["status"], "running")
+                self.assertNotIn("Traceback", err)
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups")
+    def test_a_signal_as_punk_starts_still_stops_it(self):
+        # a SIGTERM that lands while Popen is still returning punk (here: sent from inside Popen, right after the
+        # fork) must not kill run with punk left running in its own session
+        pidf = os.path.join(os.path.dirname(self.log), "punk.pid")
+        script = (f"import importlib.util, os, signal, subprocess, sys\n"
+                  f"spec = importlib.util.spec_from_file_location('gatherlane', {TOOL!r})\n"
+                  f"gl = importlib.util.module_from_spec(spec); spec.loader.exec_module(gl)\n"
+                  f"real = subprocess.Popen\n"
+                  f"def popen(*a, **k):\n"
+                  f"    p = real(*a, **k)\n"
+                  f"    open({pidf!r}, 'w').write(str(p.pid))\n"
+                  f"    os.kill(os.getpid(), signal.SIGTERM)\n"
+                  f"    return p\n"
+                  f"subprocess.Popen = popen\n"
+                  f"gl.punk_session('start', 'acme/job', {self.project!r}, 60)\n"
+                  f"print('run went on')\n")
+        _, extra = self.run_args(FAKE_PUNK_START="hang")
+        outf = os.path.join(os.path.dirname(self.log), "out")  # a file, not a pipe: an orphan punk would hold a pipe open
+        t0 = time.monotonic()
+        with open(outf, "w") as out:
+            rc = subprocess.call([sys.executable, "-c", script], env=self.cli_env(extra), stdout=out, stderr=out, timeout=60)
+        took = time.monotonic() - t0
+        with open(pidf) as f:
+            pid = int(f.read())
+        self.addCleanup(lambda: alive(pid, 0) and os.killpg(pid, signal.SIGKILL))
+        with open(outf) as f:
+            out = f.read()
+        self.assertEqual(rc, -signal.SIGTERM, out)
+        self.assertNotIn("run went on", out)
+        self.assertFalse(alive(pid), "punk outlived a SIGTERM that landed as it started")
+        self.assertLess(took, 20, "run waited for punk's own 30 seconds instead of stopping it")
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups")
     def test_an_ignored_sighup_stays_ignored(self):
         # under nohup, SIGHUP does not stop the step: it runs on until the time limit, and run reports as usual
         hung = lambda calls: any("child" in c for c in calls)
@@ -670,6 +773,19 @@ class RunMemoryPunk(FakeServer):
                 self.assertEqual(self.steps(), ["start", "agent", "end"])
                 self.assertEqual(self.punk_lines(r), [f"gatherlane: --memory punk: GATHERLANE_PUNK_TIMEOUT={bad!r} is not a "
                                                       "positive number of seconds; using 120"])
+                self.assertEqual(self.status()["status"], "failed")
+
+    def test_timeout_over_an_hour_logs_once_and_uses_an_hour(self):
+        for big in ("3601", "1e308"):
+            with self.subTest(big=big):
+                os.path.exists(self.log) and os.unlink(self.log)
+                r = self.run_agent(code="raise SystemExit(4)", GATHERLANE_PUNK_TIMEOUT=big, FAKE_PUNK_START="hang",
+                                   FAKE_PUNK_HANG="1", timeout=60)
+                self.assertEqual(r.returncode, 4, r.stderr)
+                self.assertEqual(self.steps(), ["start", "agent", "end"])
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(self.punk_lines(r), [f"gatherlane: --memory punk: GATHERLANE_PUNK_TIMEOUT={big!r} is more "
+                                                      "than 3600 seconds; using 3600"])
                 self.assertEqual(self.status()["status"], "failed")
 
     def test_project_must_be_an_absolute_path(self):
@@ -744,7 +860,8 @@ class PunkTimeout(EnvCase):
     def test_default_valid_and_invalid(self):
         for value, want, logged in ((None, 120, False), ("", 120, False), ("2.5", 2.5, False), (" 30 ", 30, False),
                                     ("abc", 120, True), ("0", 120, True), ("-1", 120, True), ("nan", 120, True),
-                                    ("inf", 120, True)):
+                                    ("inf", 120, True), ("3600", 3600, False), ("3600.5", 3600, True),
+                                    ("86400", 3600, True), ("1e308", 3600, True)):
             with self.subTest(value=value):
                 os.environ.pop("GATHERLANE_PUNK_TIMEOUT", None)
                 if value is not None:
