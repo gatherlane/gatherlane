@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Tests for tools/gatherlane.py: python3 -m unittest discover -s tests
 # Standard library only. The CLI tests run the reporter against tests/fake_github.py.
-import datetime as dt, importlib.util, json, os, shutil, socket, subprocess, sys, tempfile, time, unittest, urllib.request
+import contextlib, datetime as dt, importlib.util, io, json, os, shutil, socket, subprocess, sys, tempfile, time, unittest, urllib.request
 from zoneinfo import ZoneInfo
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -165,12 +165,13 @@ class FakeServer(unittest.TestCase):
     def files(self):
         return json.loads(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/dump").read())
 
-    def cli(self, *args, extra=None):
+    def cli(self, *args, extra=None, input=None, timeout=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith("GATHERLANE_")}
         env.update(GATHERLANE_API=f"http://127.0.0.1:{self.port}", GATHERLANE_TOKEN="t", GATHERLANE_REPO="o/r",
                    GATHERLANE_TZ="UTC", GATHERLANE_ENV=os.devnull)
         env.update(extra or {})
-        return subprocess.run([sys.executable, TOOL, *args], env=env, capture_output=True, text=True)
+        return subprocess.run([sys.executable, TOOL, *args], env=env, capture_output=True, text=True, input=input,
+                              timeout=timeout)
 
 
 class CLI(FakeServer):
@@ -241,16 +242,54 @@ class CLI(FakeServer):
 
 
 FAKE_PUNK = """#!{python}
-# A stand-in for punk: records its argv, whether it saw the writer token and every status on the
-# fake server at that moment, then exits with FAKE_PUNK_START or FAKE_PUNK_END (default 0).
-import json, os, sys, urllib.request
+# A stand-in for punk: records its argv, its pid, whether it saw the writer token and every status on
+# the fake server at that moment. FAKE_PUNK_START or FAKE_PUNK_END says what it does next: a number
+# is its exit code (default 0); "signal" kills itself with SIGKILL; "hang" starts a child and both
+# sleep for FAKE_PUNK_HANG seconds; "hang-ignore-term" does the same with SIGTERM ignored by both.
+# With FAKE_PUNK_STDIN set it also records what it read from its standard input.
+import json, os, signal, stat, subprocess, sys, time, urllib.request
 dump = json.loads(urllib.request.urlopen(os.environ["FAKE_PUNK_DUMP"]).read())
-with open(os.environ["FAKE_PUNK_LOG"], "a") as f:
-    f.write(json.dumps({{"argv": sys.argv[1:], "token": "GATHERLANE_TOKEN" in os.environ,
-                        "statuses": {{k: v.get("status") for k, v in dump.items()}}}}) + "\\n")
 step = sys.argv[4] if len(sys.argv) > 4 else ""
-sys.exit(int(os.environ.get("FAKE_PUNK_" + step.upper(), "0")))
+mode = os.environ.get("FAKE_PUNK_" + step.upper(), "0")
+rec = {{"argv": sys.argv[1:], "pid": os.getpid(), "token": "GATHERLANE_TOKEN" in os.environ,
+        "statuses": {{k: v.get("status") for k, v in dump.items()}}}}
+if os.environ.get("FAKE_PUNK_STDIN"):
+    st = os.fstat(0)
+    rec["stdin_is_devnull"] = stat.S_ISCHR(st.st_mode) and st.st_rdev == os.stat(os.devnull).st_rdev
+    rec["stdin"] = sys.stdin.read()
+hang = os.environ.get("FAKE_PUNK_HANG", "30")
+if mode.startswith("hang"):
+    ign = mode == "hang-ignore-term"
+    if ign:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    rec["child"] = subprocess.Popen([sys.executable, "-c", "import signal, time\\n"
+                                     + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n" if ign else "")
+                                     + "time.sleep(" + hang + ")"],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid
+with open(os.environ["FAKE_PUNK_LOG"], "a") as f:
+    f.write(json.dumps(rec) + "\\n")
+if mode == "signal":
+    os.kill(os.getpid(), signal.SIGKILL)
+if mode.startswith("hang"):
+    time.sleep(float(hang))
+    sys.exit(0)
+sys.exit(int(mode))
 """
+
+
+def alive(pid, wait=5.0):
+    """Whether process `pid` still runs after up to `wait` seconds (a killed orphan is reaped by init)."""
+    end = time.monotonic() + wait
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        if time.monotonic() > end:
+            return True
+        time.sleep(.05)
 
 
 class RunMemoryPunk(FakeServer):
@@ -269,7 +308,8 @@ class RunMemoryPunk(FakeServer):
         os.chmod(punk, 0o755)
         self.cli("report", "--agent", "acme/job", "--status", "not_deployed", "--new")
 
-    def run_agent(self, *args, agent="acme/job", code="pass", memory=True, path=None, **settings):
+    def run_agent(self, *args, agent="acme/job", code="pass", memory=True, path=None, input=None, timeout=None,
+                  **settings):
         """`run` with a command that logs itself to the same file as punk, then runs `code`."""
         extra = {"PATH": path or self.bin, "FAKE_PUNK_LOG": self.log, "FAKE_PUNK_DUMP": f"http://127.0.0.1:{self.port}/dump",
                  "GATHERLANE_PUNK_PROJECTS": f"{agent}={self.project}"}
@@ -277,7 +317,7 @@ class RunMemoryPunk(FakeServer):
         extra = {k: v for k, v in extra.items() if v is not None}
         cmd = f"open({self.log!r},'a').write('{{\"agent\": true}}\\n');{code}"
         return self.cli("run", "--agent", agent, *(["--memory", "punk"] if memory else []), *args,
-                        "--", sys.executable, "-c", cmd, extra=extra)
+                        "--", sys.executable, "-c", cmd, extra=extra, input=input, timeout=timeout)
 
     def calls(self):
         if not os.path.exists(self.log):
@@ -395,9 +435,36 @@ class RunMemoryPunk(FakeServer):
         self.assertEqual(self.steps(), ["start"])  # neither the agent nor session end
         rec = self.status()
         self.assertEqual((rec["status"], rec["last_result"], rec["needs_human"]), ("blocked", "skipped", False))
-        self.assertEqual(rec["needs_human_reason"],
-                         "punk session start failed (exit 2); run skipped (GATHERLANE_PUNK_SKIP_ON_START_FAILURE=1)")
+        reason = "punk session start needs a person (exit 2); run skipped (GATHERLANE_PUNK_SKIP_ON_START_FAILURE=1)"
+        self.assertEqual(rec["needs_human_reason"], reason)
         self.assertIsNone(rec["current_task"])
+        self.assertEqual(self.punk_lines(r), ["gatherlane: " + reason])  # one line for the step, not two
+
+    def test_skip_record_says_what_happened(self):
+        """The skip reason names what punk did, and never an exit code punk did not return."""
+        noshebang = os.path.join(self.nobin, "punk")
+        with open(noshebang, "w") as f:
+            f.write("exit 0\n")  # executable, so shutil.which finds it, but exec refuses it
+        os.chmod(noshebang, 0o755)
+        for name, settings, want in (
+                ("exit 1", {"FAKE_PUNK_START": "1"}, "punk session start failed (exit 1); "),
+                ("signal", {"FAKE_PUNK_START": "signal"}, "punk session start was stopped by signal 9; "),
+                ("no shebang", {"path": self.nobin}, "punk session start could not start ("),
+                ("timeout", {"FAKE_PUNK_START": "hang", "GATHERLANE_PUNK_TIMEOUT": "2"},
+                 "punk session start timed out after 2 seconds and was stopped; ")):
+            with self.subTest(name):
+                os.path.exists(self.log) and os.unlink(self.log)
+                r = self.run_agent(GATHERLANE_PUNK_SKIP_ON_START_FAILURE="1", timeout=60, **settings)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("agent", self.steps())
+                self.assertNotIn("end", self.steps())
+                rec = self.status()
+                self.assertEqual((rec["status"], rec["last_result"]), ("blocked", "skipped"))
+                self.assertTrue(rec["needs_human_reason"].startswith(want), rec["needs_human_reason"])
+                self.assertTrue(rec["needs_human_reason"].endswith("; run skipped (GATHERLANE_PUNK_SKIP_ON_START_FAILURE=1)"))
+                if name != "exit 1":
+                    self.assertNotIn("exit", rec["needs_human_reason"])
+                self.assertEqual(self.punk_lines(r), ["gatherlane: " + rec["needs_human_reason"]])
 
     def test_skip_on_start_failure_only_when_set_and_start_failed(self):
         for settings, want in (({"FAKE_PUNK_START": "1"}, ["start", "agent", "end"]),
@@ -420,6 +487,131 @@ class RunMemoryPunk(FakeServer):
         self.assertEqual((r.stdout, r.stderr), ("status/acme/job.json: running\nstatus/acme/job.json: idle\n", ""))
         self.assertEqual(self.status()["status"], "idle")
 
+    def test_punk_stdin_is_dev_null(self):
+        """The agent gets run's standard input; punk, at start and at end, gets /dev/null."""
+        code = "import json,sys;open(%r,'a').write(json.dumps({'agent_stdin': sys.stdin.read()})+'\\n')" % self.log
+        r = self.run_agent(code=code, FAKE_PUNK_STDIN="1", input="AGENT-STDIN\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        start, _, agent_stdin, end = self.calls()
+        self.assertEqual([start["argv"][3], end["argv"][3]], ["start", "end"])
+        self.assertEqual((start["stdin"], end["stdin"]), ("", ""))
+        self.assertEqual((start["stdin_is_devnull"], end["stdin_is_devnull"]), (True, True))
+        self.assertEqual(agent_stdin, {"agent_stdin": "AGENT-STDIN\n"})
+
+    def test_punk_that_cannot_start_does_not_stop_the_agent(self):
+        """An executable punk without a shebang: exec fails (OSError), run logs it and carries on."""
+        noshebang = os.path.join(self.nobin, "punk")
+        with open(noshebang, "w") as f:
+            f.write("exit 0\n")
+        os.chmod(noshebang, 0o755)
+        r = self.run_agent(path=self.nobin, code="raise SystemExit(3)")
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertEqual(self.steps(), ["agent"])
+        self.assertNotIn("Traceback", r.stderr)
+        lines = self.punk_lines(r)
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(lines[0].startswith("gatherlane: punk session start could not start ("), lines)
+        self.assertTrue(lines[1].startswith("gatherlane: punk session end could not start ("), lines)
+        self.assertTrue(all(l.endswith("), ignored") for l in lines), lines)
+        rec = self.status()
+        self.assertEqual((rec["status"], rec["needs_human_reason"]), ("failed", "exit code 3"))
+
+    def test_punk_killed_by_a_signal_is_logged(self):
+        r = self.run_agent(FAKE_PUNK_START="signal", FAKE_PUNK_END="signal")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.steps(), ["start", "agent", "end"])
+        self.assertEqual(self.punk_lines(r), ["gatherlane: punk session start was stopped by signal 9, ignored",
+                                              "gatherlane: punk session end was stopped by signal 9, ignored"])
+        self.assertEqual(self.status()["status"], "idle")
+
+    def test_timeout_stops_a_hanging_step_and_the_run_goes_on(self):
+        for step, code, want_rc, want_status in (("START", "raise SystemExit(3)", 3, "failed"), ("START", "pass", 0, "idle"),
+                                                 ("END", "raise SystemExit(5)", 5, "failed"), ("END", "pass", 0, "idle")):
+            with self.subTest(step=step, agent=want_rc):
+                os.path.exists(self.log) and os.unlink(self.log)
+                t0 = time.monotonic()
+                r = self.run_agent(code=code, GATHERLANE_PUNK_TIMEOUT="2", timeout=60, **{"FAKE_PUNK_" + step: "hang"})
+                took = time.monotonic() - t0
+                self.assertEqual(r.returncode, want_rc, r.stderr)
+                self.assertEqual(self.steps(), ["start", "agent", "end"])  # end still runs after a timed-out start
+                self.assertLess(took, 20)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(self.punk_lines(r), [f"gatherlane: punk session {step.lower()} timed out after 2 seconds "
+                                                      "and was stopped, ignored"])
+                rec = self.status()
+                self.assertEqual(rec["status"], want_status)
+                if want_rc:
+                    self.assertEqual(rec["needs_human_reason"], f"exit code {want_rc}")
+                hung = [c for c in self.calls() if "child" in c]
+                self.assertEqual(len(hung), 1)
+                self.assertFalse(alive(hung[0]["pid"]), "punk still runs after the timeout")
+                self.assertFalse(alive(hung[0]["child"]), "a child punk started still runs after the timeout")
+
+    def test_timeout_kills_a_punk_that_ignores_sigterm(self):
+        t0 = time.monotonic()
+        r = self.run_agent(FAKE_PUNK_END="hang-ignore-term", GATHERLANE_PUNK_TIMEOUT="1", timeout=60)
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreater(took, gl.PUNK_KILL_GRACE)  # SIGTERM did nothing, so run waited out the grace
+        self.assertLess(took, 20)  # and then SIGKILL ended it, well before the fake's own 30 seconds
+        self.assertEqual(self.steps(), ["start", "agent", "end"])
+        self.assertEqual(self.punk_lines(r), ["gatherlane: punk session end timed out after 1 seconds and was stopped, ignored"])
+        hung = self.calls()[-1]
+        self.assertFalse(alive(hung["pid"]), "punk ignored SIGTERM and still runs")
+        self.assertFalse(alive(hung["child"]), "punk's child ignored SIGTERM and still runs")
+        self.assertEqual(self.status()["status"], "idle")
+
+    def test_timeout_setting_from_the_env_file(self):
+        envf = os.path.join(self.project, "env")
+        with open(envf, "w") as f:
+            f.write("export GATHERLANE_PUNK_TIMEOUT=2\n")
+        r = self.run_agent(FAKE_PUNK_START="hang", GATHERLANE_ENV=envf, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.punk_lines(r), ["gatherlane: punk session start timed out after 2 seconds and was stopped, ignored"])
+
+    def test_bad_timeout_setting_logs_once_and_uses_the_default(self):
+        for bad in ("abc", "0", "-3", "nan", "inf", "1e999"):
+            with self.subTest(bad=bad):
+                os.path.exists(self.log) and os.unlink(self.log)
+                r = self.run_agent(code="raise SystemExit(4)", GATHERLANE_PUNK_TIMEOUT=bad, timeout=60)
+                self.assertEqual(r.returncode, 4, r.stderr)
+                self.assertEqual(self.steps(), ["start", "agent", "end"])
+                self.assertEqual(self.punk_lines(r), [f"gatherlane: --memory punk: GATHERLANE_PUNK_TIMEOUT={bad!r} is not a "
+                                                      "positive number of seconds; using 120"])
+                self.assertEqual(self.status()["status"], "failed")
+
+    def test_project_must_be_an_absolute_path(self):
+        for value in ("relative/dir", "./project", "-h", "~no-such-user-zz/project"):
+            with self.subTest(value=value):
+                os.path.exists(self.log) and os.unlink(self.log)
+                r = self.run_agent(code="raise SystemExit(6)", GATHERLANE_PUNK_PROJECTS=f"acme/job={value}")
+                self.assertEqual(r.returncode, 6, r.stderr)
+                self.assertEqual(self.steps(), ["agent"])
+                self.assertEqual(self.punk_lines(r), [f"gatherlane: --memory punk: the GATHERLANE_PUNK_PROJECTS directory for "
+                                                      f"acme/job is not an absolute path ({value!r}); running without punk"])
+                self.assertEqual(self.status()["status"], "failed")
+        # `~` is expanded first, so a home-relative value is absolute
+        home = os.path.dirname(self.project)
+        os.unlink(self.log)
+        r = self.run_agent(GATHERLANE_PUNK_PROJECTS="acme/job=~/project", HOME=home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls()[0]["argv"][-1], self.project)
+        self.assertEqual(self.punk_lines(r), [])
+
+    def test_project_with_a_comma_is_refused_not_cut(self):
+        r = self.run_agent(code="raise SystemExit(6)", GATHERLANE_PUNK_PROJECTS=f"acme/job={self.project},two")
+        self.assertEqual(r.returncode, 6, r.stderr)
+        self.assertEqual(self.steps(), ["agent"])
+        self.assertEqual(self.punk_lines(r), ["gatherlane: --memory punk: the GATHERLANE_PUNK_PROJECTS entry for acme/job "
+                                              "is followed by ',two', which is not an <id>=<dir> pair (a directory cannot "
+                                              "contain a comma); running without punk"])
+        # a comma in another agent's entry does not stop this one
+        os.unlink(self.log)
+        r = self.run_agent(GATHERLANE_PUNK_PROJECTS=f"acme/other=/srv/one,two, acme/job={self.project}")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.steps(), ["start", "agent", "end"])
+        self.assertEqual(self.punk_lines(r), [])
+
     def test_unknown_id_runs_without_punk(self):
         r = self.run_agent(agent="acme/typo", code="raise SystemExit(5)")
         self.assertEqual(r.returncode, 5)
@@ -431,8 +623,29 @@ class RunMemoryPunk(FakeServer):
 
 class PunkProjects(EnvCase):
     def test_pairs_spaces_home_and_duplicates(self):
-        os.environ["GATHERLANE_PUNK_PROJECTS"] = " a/x = /srv/x ,b/y=~/gatherlane,broken,=z,c/z=/1,c/z=/2,d/w=/w,d/w=/w"
-        self.assertEqual(gl.punk_projects(), {"a/x": "/srv/x", "b/y": os.path.expanduser("~/gatherlane"), "c/z": None, "d/w": "/w"})
+        os.environ["GATHERLANE_PUNK_PROJECTS"] = ("broken, a/x = /srv/x ,b/y=~/gatherlane,=z,c/z=/1,c/z=/2,d/w=/w,d/w=/w,"
+                                                  "e/v=/srv/a=b,f/u=/srv/one, two ,,g/t=/t,c/z=/1,")
+        dirs, problems = gl.punk_projects()
+        self.assertEqual(dirs, {"a/x": "/srv/x", "b/y": os.path.expanduser("~/gatherlane"), "d/w": "/w", "e/v": "/srv/a=b",
+                                "g/t": "/t"})
+        self.assertEqual(sorted(problems), ["c/z", "f/u"])
+        self.assertIn("listed twice", problems["c/z"])
+        self.assertIn("followed by ',two'", problems["f/u"])
+
+
+class PunkTimeout(EnvCase):
+    def test_default_valid_and_invalid(self):
+        for value, want, logged in ((None, 120, False), ("", 120, False), ("2.5", 2.5, False), (" 30 ", 30, False),
+                                    ("abc", 120, True), ("0", 120, True), ("-1", 120, True), ("nan", 120, True),
+                                    ("inf", 120, True)):
+            with self.subTest(value=value):
+                os.environ.pop("GATHERLANE_PUNK_TIMEOUT", None)
+                if value is not None:
+                    os.environ["GATHERLANE_PUNK_TIMEOUT"] = value
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(gl.punk_timeout(), want)
+                self.assertEqual(len(err.getvalue().splitlines()), 1 if logged else 0, err.getvalue())
 
 
 class Init(FakeServer):
