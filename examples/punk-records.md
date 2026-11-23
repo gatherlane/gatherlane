@@ -110,6 +110,85 @@ README describes. The store lives in `.punk-records` in your home directory unle
 
 ## 3. Cron and other schedulers
 
+### The simpler way: `run --memory punk`
+
+`gatherlane.py run` can call `punk` itself. Name each agent's project directory once, in the env
+file the reporter already reads (`~/.config/gatherlane/env`), as comma separated `<id>=<dir>`
+pairs:
+
+```sh
+export GATHERLANE_PUNK_PROJECTS=<operation>/web-agent=/srv/agents/web,<operation>/finance-agent=/srv/agents/finance
+```
+
+Then add `--memory punk` to the plain `run` line from
+[cron-and-sessions.md](cron-and-sessions.md). No wrapper script is needed:
+
+```cron
+PATH=<folder that holds punk>:/usr/local/bin:/usr/bin:/bin
+# web-agent: every 15 minutes, with memory
+*/15 * * * * . ~/.config/gatherlane/env && python3 ~/gatherlane/tools/gatherlane.py run --agent <operation>/web-agent --cron "*/15 * * * *" --memory punk -- /opt/agent-runner/run.sh web-agent >> ~/logs/web-agent.log 2>&1
+```
+
+Cron's `PATH` still has to reach `punk` (and `age` for an encrypted store), as below.
+
+On each run, `run` checks the pause flag first. A paused agent gets no `punk` call at all. Otherwise
+`run` reports `running`, runs `punk --agent <operation>/web-agent session start --project
+/srv/agents/web`, runs the agent command whatever that returned, then runs
+`punk --agent <operation>/web-agent session end --project /srv/agents/web` whatever the agent's
+result (a command that cannot be started at all included), and reports `idle`, `sleeping`,
+`failed` or `waiting` as it does without `--memory`. These are the only two `punk` commands it
+runs. `punk` gets the same environment as the agent command, without `GATHERLANE_TOKEN`, and no
+standard input. `run` sets no time limit on `punk`, for the reason under "No time limit on the
+remote" below.
+
+A `punk` result never changes `run`'s exit code or the reported status. `run` adds at most one
+line per step to the log, each starting with `gatherlane:`, after `punk`'s own lines:
+
+| Log line | Meaning |
+|---|---|
+| (none) | exit 0. `punk` prints its own warnings, such as an unreachable remote, and still exits 0 |
+| `punk session <step> failed (exit 1), ignored` | as in the wrapper's table below: no store, project not tracked, store busy for `PUNK_LOCK_TIMEOUT`, or `age` missing |
+| `punk session <step> needs a person (exit 2): ...` | a conflict or a file blocked as a possible secret; run `punk status` and `punk diff`. A `punk` older than 0.6.0 also exits 2, because it has no `session` command |
+| `punk session <step> was stopped by signal <n>, ignored` | `punk` was killed |
+| `punk session <step> could not start (...), ignored` | `punk` is on `PATH` but could not be started, for example not executable |
+
+Some settings mean `run` does not call `punk` at all. Each logs one line, once, and the agent
+command runs as usual:
+
+| Log line | Meaning |
+|---|---|
+| `--memory punk: '<id>' is not a punk agent id ...` | the id is not one line of letters, digits and `. _ / @ : + -` starting with a letter or digit, at most 128 characters, the pattern `punk` itself checks. `run` checks it first because `punk` 0.6.0 reports a bad id with exit 2, the same code as a conflict |
+| `--memory punk: no project directory for <id> in GATHERLANE_PUNK_PROJECTS; ...` | the setting is missing, or does not name this agent |
+| `--memory punk: <id> is listed twice in GATHERLANE_PUNK_PROJECTS with different directories; ...` | one id, two directories: `run` does not guess which one |
+| `--memory punk: punk is not on PATH; ...` | `punk` is not installed, or not on cron's `PATH` |
+| `--memory punk: no punk session for an id without a status file; ...` | the id has no status file yet, so `run` runs the command without reporting, as it always has, and without `punk` too: `run` does not check the pause flag for such an id, and a mistyped id would sign commits in the store with the wrong `Punk-Agent` |
+
+`GATHERLANE_PUNK_PROJECTS` entries are split at the first `=`; spaces around each part are
+ignored and a leading `~` is expanded. A directory cannot contain a comma. An agent id never
+contains `,` or `=`, so the setting cannot be read two ways.
+
+**Skipping the run when `session start` fails.** By default the agent runs even when
+`session start` exits 1 or 2, so an agent never stops working because of its memory. To skip the
+run instead, add this to the env file:
+
+```sh
+export GATHERLANE_PUNK_SKIP_ON_START_FAILURE=1
+```
+
+With that set (only the value `1` counts), a `session start` that exits with anything but 0, or
+cannot be started, means the agent command does not run and `session end` does not run either, so
+nothing is saved from a project that was never restored. `run` logs
+`punk session start failed (exit <n>); run skipped (GATHERLANE_PUNK_SKIP_ON_START_FAILURE=1)`,
+reports the agent `blocked` with `last_result` `skipped`, that same line as the reason and no
+current task, and exits 0, as a paused run does. The record has `needs_human` false and is not
+`failed`, so it does not reach the inbox; the agent's card shows `blocked` and the reason. The settings in the table just above still
+run the agent with this set, because `punk` never ran.
+
+### The wrapper script
+
+The wrapper below does the same job from outside the reporter. Use it with a reporter older than
+`--memory punk`, or when you want to change what happens around `punk`.
+
 Save this as `/usr/local/bin/punk-run` (or any folder on cron's `PATH`) and make it executable
 with `chmod 755`. It wraps the same `gatherlane.py run` line as
 [cron-and-sessions.md](cron-and-sessions.md):
@@ -361,7 +440,8 @@ reporter, or with the runner around it.
 - **Exit 2 in 0.6.0 can be a usage error.** `punk` 0.6.0 reports a malformed `--agent` id (one
   that is not one line of letters, digits and `. _ / @ : + -` starting with a letter or digit) as
   a command line usage error, which also exits 2. So when the wrapper logs "needs a person" and
-  `punk status` shows nothing to settle, check the agent id. The fix
+  `punk status` shows nothing to settle, check the agent id. `run --memory punk` checks the id
+  against that pattern before it calls `punk`, and logs a bad one instead. The fix
   ([gablooge/punk-records#48](https://github.com/gablooge/punk-records/pull/48), merged after
   0.6.0) makes that exit 1 once it is released.
 
