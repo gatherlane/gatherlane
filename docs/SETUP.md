@@ -389,6 +389,25 @@ echo '{"needs_human_kind":"escalation","reason":"Refund outside policy","issue":
 `--cron` is read in `GATHERLANE_TZ` (UTC if unset). Set `timeZone` in `config.js` to the same
 zone so the office shows times the way the agents report them.
 
+**Memory between runs (optional).** With [Punk Records](../examples/punk-records.md) installed,
+`run --memory punk` calls `punk session start` before the command and `punk session end` after it,
+for an agent that is not paused. These settings in the env file go with it:
+
+```sh
+export GATHERLANE_PUNK_PROJECTS=<operation>/<agent>=/srv/agents/<agent>   # comma separated <id>=<dir> pairs
+export GATHERLANE_PUNK_SKIP_ON_START_FAILURE=1                            # optional: skip the run when session start fails
+export GATHERLANE_PUNK_TIMEOUT=120                                        # optional: seconds per punk step, default 120, at most 3600
+```
+
+Each directory must be an absolute path, and project folders may not contain commas (a folder
+like `/srv/one,v2=x` would be read as two entries, see
+[Punk Records](../examples/punk-records.md)). A step that runs past `GATHERLANE_PUNK_TIMEOUT` is
+stopped and counts as a `punk` failure. A value above 3600 logs one line and uses 3600.
+
+A `punk` failure, a missing `punk` or a missing project entry is logged and never changes the exit
+code or the reported status. Without `--memory`, `run` behaves as above and reads none of these
+settings.
+
 **By runner:**
 
 | Where the agent runs | Wiring |
@@ -398,7 +417,7 @@ zone so the office shows times the way the agents report them.
 | n8n | Execute Command nodes, snippet in `examples/cron-and-sessions.md` |
 | Claude Code subagents (`.claude/agents/*.md`) | the "Gatherlane status" section in `examples/cron-and-sessions.md`, appended to each agent file |
 | Orchestrator sessions | report `running` at the start of a cycle and `idle` at the end, as `orchestrator-1`, `orchestrator-<n>` |
-| Memory between runs (optional) | Punk Records: the `punk-run` cron wrapper, the Claude Code plugin or its MCP tools, in [`examples/punk-records.md`](../examples/punk-records.md) |
+| Memory between runs (optional) | Punk Records: `run --memory punk` or the `punk-run` cron wrapper, the Claude Code plugin or its MCP tools, in [`examples/punk-records.md`](../examples/punk-records.md) |
 
 **Agents that are not running yet.** Mark them `not_deployed` once, so the office shows "not
 deployed" instead of "no data". `examples/cron-and-sessions.md` has a loop over every id in

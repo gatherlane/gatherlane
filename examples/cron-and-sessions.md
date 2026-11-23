@@ -30,8 +30,9 @@ env file and the same prefixes to `agentPrefixes` in `config.js`.
 */15 * * * * . ~/.config/gatherlane/env && python3 ~/gatherlane/tools/gatherlane.py run --agent <operation>/support-agent --cron "*/15 * * * *" -- /opt/agent-runner/run.sh support-agent >> ~/logs/support-agent.log 2>&1
 ```
 
-To carry an agent's memory files from one run to the next, wrap the same line in `punk-run`
-from [punk-records.md](punk-records.md). It is optional; without it nothing here changes.
+To carry an agent's memory files from one run to the next, add `--memory punk` to the same line
+and name the agent's project in `GATHERLANE_PUNK_PROJECTS`, or wrap the line in `punk-run`; both
+are in [punk-records.md](punk-records.md). It is optional; without it nothing here changes.
 
 If the agent is started over HTTP (for example `POST /agents/{name}/run`), wrap the curl call
 instead of the script. A runner's own kill switch still applies; `control/pause.json` is the

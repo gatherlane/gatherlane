@@ -12,13 +12,30 @@ Environment (each may also be set as `export NAME=value` in the env file, see GA
   GATHERLANE_OPS     id prefixes that share an operation, e.g. "web=acme,orchestrator=shared".
                      Otherwise an id's first part is its operation ("acme/support" -> acme), and an
                      id without a slash goes to "shared".
+  GATHERLANE_PUNK_PROJECTS
+                     for `run --memory punk`: each agent's project directory, as comma separated
+                     ID=DIR pairs, e.g. "acme/web=/srv/agents/web,acme/api=/srv/agents/api".
+                     DIR must be an absolute path (a leading ~ is expanded). Project folders may
+                     not contain commas.
+  GATHERLANE_PUNK_TIMEOUT
+                     seconds each `punk session` step may take with --memory punk, default 120,
+                     at most 3600 (a larger value logs one line and uses 3600). A step that takes
+                     longer is stopped and counts as a punk failure.
+  GATHERLANE_PUNK_SKIP_ON_START_FAILURE
+                     1: with --memory punk, skip the command when `punk session start` fails, and
+                     report blocked with last_result skipped. Otherwise the command runs anyway.
   GATHERLANE_ENV     file read for any of the above not already set, default ~/.config/gatherlane/env
 
 Commands
-  run          --agent ID [--cron EXPR] [--runbook URL] [--workflow URL] -- COMMAND ...
+  run          --agent ID [--cron EXPR] [--runbook URL] [--workflow URL] [--memory punk] -- COMMAND ...
                check pause → report running → run COMMAND → report idle/sleeping/failed/waiting.
                COMMAND may write JSON to the file named in $GATHERLANE_OUT to ask for a human:
                  {"needs_human_kind": "escalation", "reason": "...", "issue": "https://..."}
+               --memory punk: run `punk --agent ID session start --project DIR` before COMMAND and
+               `punk --agent ID session end --project DIR` after it, DIR from GATHERLANE_PUNK_PROJECTS.
+               Only an agent that is not paused and has a status file gets them. A punk result is
+               logged and never changes the exit code or the reported status; a step that runs
+               past GATHERLANE_PUNK_TIMEOUT is stopped (examples/punk-records.md).
   report       --agent ID --status STATUS [fields...]   write/merge one status file; an id with no
                                                         file yet needs --new (catches mistyped ids)
   check-pause  --agent ID                               exit 3 if paused, 0 otherwise
@@ -29,7 +46,7 @@ Commands
                app/instance/ (generated building, SAMPLE data), register the agents as
                not_deployed, add the settings to the env file, and print the remaining steps
 """
-import argparse, base64, datetime as dt, json, os, re, shlex, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
+import argparse, base64, contextlib, datetime as dt, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
 from zoneinfo import ZoneInfo
 
 SCHEMA = "gatherlane.agent-status/v1"
@@ -286,6 +303,200 @@ def ns(**kw):
     return argparse.Namespace(**base)
 
 
+# ---------- run --memory punk: Punk Records sessions around the command ----------
+PUNK_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,127}"  # punk's own pattern for --agent
+
+
+def log(msg):
+    print(f"gatherlane: {msg}", file=sys.stderr)
+
+
+def punk_projects():
+    """GATHERLANE_PUNK_PROJECTS as ({id: dir}, {id: why its entry cannot be used}). An id listed twice
+    with different dirs, or whose dir is followed by a part that is not a pair with a punk id before
+    its `=`, goes to the second."""
+    dirs, problems, last = {}, {}, None
+    for part in (env("GATHERLANE_PUNK_PROJECTS", "") or "").split(","):
+        k, v = (x.strip() for x in part.split("=", 1)) if "=" in part else (None, None)
+        if k is None or not re.fullmatch(PUNK_ID_RE, k):  # not a pair, or no punk id before the `=`
+            if part.strip() and last is not None and last not in problems:  # the dir held a comma
+                problems[last] = (f"the GATHERLANE_PUNK_PROJECTS entry for {last} is followed by {',' + part.strip()!r}, "
+                                  f"which is not an <id>=<dir> pair (a directory cannot contain a comma)")
+                dirs.pop(last, None)
+            continue
+        last = k if k and v else None
+        if last is None or k in problems:
+            continue
+        v = os.path.expanduser(v)
+        if k in dirs and dirs[k] != v:
+            problems[k] = f"{k} is listed twice in GATHERLANE_PUNK_PROJECTS with different directories"
+            del dirs[k]
+        else:
+            dirs[k] = v
+    return dirs, problems
+
+
+def punk_project(agent):
+    """The project directory for `punk session`, or None after one log line saying why not."""
+    if not re.fullmatch(PUNK_ID_RE, agent):
+        log(f"--memory punk: {agent!r} is not a punk agent id (letters, digits and . _ / @ : + -, starting with "
+            f"a letter or digit, at most 128 characters); running without punk")
+        return None
+    dirs, problems = punk_projects()
+    if agent in problems:
+        log(f"--memory punk: {problems[agent]}; running without punk")
+        return None
+    if agent not in dirs:
+        log(f"--memory punk: no project directory for {agent} in GATHERLANE_PUNK_PROJECTS; running without punk")
+        return None
+    if not os.path.isabs(dirs[agent]):  # a relative dir would follow the scheduler's cwd, `-x` would read as an option
+        log(f"--memory punk: the GATHERLANE_PUNK_PROJECTS directory for {agent} is not an absolute path "
+            f"({dirs[agent]!r}); running without punk")
+        return None
+    if not shutil.which("punk"):
+        log("--memory punk: punk is not on PATH; running without punk")
+        return None
+    return dirs[agent]
+
+
+PUNK_TIMEOUT = 120      # seconds per punk step unless GATHERLANE_PUNK_TIMEOUT says otherwise
+PUNK_TIMEOUT_MAX = 3600  # the most GATHERLANE_PUNK_TIMEOUT may give
+PUNK_KILL_GRACE = 5     # seconds between SIGTERM and SIGKILL for a step that ran out of time
+
+
+def punk_timeout():
+    """GATHERLANE_PUNK_TIMEOUT in seconds. Anything but a positive finite number logs one line and gives the default;
+    more than PUNK_TIMEOUT_MAX logs one line and gives PUNK_TIMEOUT_MAX."""
+    raw = env("GATHERLANE_PUNK_TIMEOUT")
+    if raw is None:
+        return PUNK_TIMEOUT
+    try:
+        t = float(raw)
+    except ValueError:
+        t = None
+    if t is None or not 0 < t < float("inf"):  # nan fails both comparisons
+        log(f"--memory punk: GATHERLANE_PUNK_TIMEOUT={raw!r} is not a positive number of seconds; using {PUNK_TIMEOUT}")
+        return PUNK_TIMEOUT
+    if t > PUNK_TIMEOUT_MAX:
+        log(f"--memory punk: GATHERLANE_PUNK_TIMEOUT={raw!r} is more than {PUNK_TIMEOUT_MAX} seconds; using {PUNK_TIMEOUT_MAX}")
+        return PUNK_TIMEOUT_MAX
+    return t
+
+
+def punk_stop(p):
+    """Stop punk and whatever it started (git, ssh): punk runs as the leader of its own process group, so
+    signal the group. SIGTERM first, so git can drop its lock files, then SIGKILL after PUNK_KILL_GRACE s."""
+    def group(sig):  # True when the group still had a member to signal
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(p.pid, sig)
+            elif sig:
+                p.kill()  # no process groups (Windows): punk alone
+            return hasattr(os, "killpg")
+        except OSError:  # the group is gone
+            return False
+    try:
+        group(signal.SIGTERM)
+        end = time.monotonic() + PUNK_KILL_GRACE
+        while time.monotonic() < end and (p.poll() is None or group(0)):
+            time.sleep(.05)
+    finally:
+        group(getattr(signal, "SIGKILL", signal.SIGTERM))
+        p.wait()
+
+
+class PunkSignal(BaseException):
+    """SIGTERM or SIGHUP arrived while a punk step ran (see punk_guard)."""
+
+
+class PunkGuard:
+    """What punk_guard knows: punk once it has started (`p`), the first signal (`got`), and whether punk is being
+    stopped (`stopping`), after which no signal raises."""
+    def __init__(self):
+        self.p, self.got, self.stopping = None, [], False
+
+    def on_signal(self, signum, frame):
+        if self.got:  # a second signal: the first one decides, and the stop it started goes on
+            return
+        self.got.append(signum)
+        if self.p is not None and not self.stopping:  # before punk has started, started() raises instead
+            self.interrupt()
+
+    def interrupt(self):
+        raise KeyboardInterrupt if self.got[0] == signal.SIGINT else PunkSignal(self.got[0])
+
+    def started(self, p):
+        self.p = p
+        if self.got:  # a signal came while Popen was still starting punk
+            self.interrupt()
+
+    def stop(self):
+        self.stopping = True
+        punk_stop(self.p)
+
+
+@contextlib.contextmanager
+def punk_guard():
+    """Around a punk step, from before punk starts: if anything interrupts it (Ctrl-C, or SIGTERM or SIGHUP,
+    which raise PunkSignal here), stop punk's process group first, since punk has its own and a signal to the
+    group of `run` never reaches it. Then `run` ends by the first signal: by SIGTERM or SIGHUP itself, or by
+    KeyboardInterrupt for SIGINT, as before. A signal whose handler is not the default (nohup's ignored SIGHUP,
+    say) is left alone. Once punk is being stopped, for a signal or for the time limit, a further SIGTERM, SIGHUP
+    or SIGINT does not cut that stop short: the first one is kept and acted on once punk is stopped."""
+    g, prev = PunkGuard(), {}
+    for name, default in (("SIGTERM", signal.SIG_DFL), ("SIGHUP", signal.SIG_DFL), ("SIGINT", signal.default_int_handler)):
+        sig = getattr(signal, name, None)
+        try:
+            if sig is not None and signal.getsignal(sig) == default:
+                prev[sig] = signal.signal(sig, g.on_signal)
+        except ValueError:  # not the main thread: no handlers, as before
+            pass
+    try:
+        try:
+            yield g
+        except BaseException:
+            if g.p is not None:
+                g.stop()
+            if not g.got:
+                raise
+    finally:
+        for sig, handler in prev.items():
+            signal.signal(sig, handler)
+    if g.got:  # punk is stopped: end the way the signal would have ended `run`
+        if g.got[0] == signal.SIGINT:  # Ctrl-C: as without the guard
+            raise KeyboardInterrupt
+        os.kill(os.getpid(), g.got[0])
+        sys.exit(128 + g.got[0])  # only reached if the signal did not end the process
+
+
+def punk_session(step, agent, project, timeout, quiet=False):
+    """Run `punk --agent AGENT session STEP --project PROJECT` for at most `timeout` seconds. Returns None
+    when punk exited 0, otherwise what happened ("failed (exit 1)", "timed out after ..."), which is
+    logged in one line unless `quiet`. Never raises for a punk problem."""
+    penv = {k: v for k, v in os.environ.items() if k != "GATHERLANE_TOKEN"}  # punk has no use for the writer token
+    with punk_guard() as g:  # the handlers go in before Popen, so no signal lands between punk starting and them
+        try:
+            p = subprocess.Popen(["punk", "--agent", agent, "session", step, "--project", project], env=penv,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            what = f"could not start ({e})"
+        else:
+            g.started(p)
+            try:
+                rc = p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                g.stop()
+                what = f"timed out after {timeout:g} seconds and was stopped"
+            else:
+                what = (None if rc == 0 else "needs a person (exit 2)" if rc == 2 else
+                        f"was stopped by signal {-rc}" if rc < 0 else f"failed (exit {rc})")
+    if what and not quiet:
+        log(f"punk session {step} {what}" + (": run `punk status`, and `punk diff <satellite> <path>` for a conflict; "
+                                              "a punk older than 0.6.0 also exits 2, see `punk --version`"
+                                              if what.startswith("needs a person") else ", ignored"))
+    return what
+
+
 def cmd_run(a):
     cmd = a.command[1:] if a.command and a.command[0] == "--" else a.command
     if not cmd:
@@ -296,6 +507,8 @@ def cmd_run(a):
     cmd_env = {**os.environ, "GATHERLANE_OUT": out, "GATHERLANE_AGENT": a.agent}
     if read_file(path_of(a.agent))[0] is None:  # a mistyped id must not stop the agent's own work
         print(unknown_agent(a.agent, path_of(a.agent)) + " Running the command without reporting.", file=sys.stderr)
+        if a.memory:  # no pause check runs for this id, and a mistyped id must not sign commits in the store
+            log("--memory punk: no punk session for an id without a status file; running without punk")
         sys.exit(subprocess.call(cmd, env=cmd_env))
     p = paused(a.agent)
     if p:
@@ -308,7 +521,20 @@ def cmd_run(a):
         cmd_report(ns(status=keep, **common))
         return
     cmd_report(ns(status="running", last_run_at="now", task=a.task, **common))
-    code = subprocess.call(cmd, env=cmd_env)
+    project = punk_project(a.agent) if a.memory else None
+    if project is not None:
+        timeout, skip = punk_timeout(), env("GATHERLANE_PUNK_SKIP_ON_START_FAILURE") == "1"
+        what = punk_session("start", a.agent, project, timeout, quiet=skip)  # with skip, the line below is the one line
+        if what and skip:
+            reason = f"punk session start {what}; run skipped (GATHERLANE_PUNK_SKIP_ON_START_FAILURE=1)"
+            log(reason)
+            cmd_report(ns(status="blocked", last_result="skipped", task="", reason=reason, **common))
+            return
+    try:
+        code = subprocess.call(cmd, env=cmd_env)
+    finally:
+        if project is not None:
+            punk_session("end", a.agent, project, timeout)
     ask = {}
     try:
         txt = open(out).read().strip()
@@ -531,7 +757,9 @@ def main():
     c = sub.add_parser("check-pause"); c.add_argument("--agent", required=True)
     u = sub.add_parser("run")
     u.add_argument("--agent", required=True); u.add_argument("--cron"); u.add_argument("--task")
-    u.add_argument("--runbook"); u.add_argument("--workflow"); u.add_argument("command", nargs=argparse.REMAINDER)
+    u.add_argument("--runbook"); u.add_argument("--workflow")
+    u.add_argument("--memory", choices=["punk"], help="Punk Records session start and end around the command")
+    u.add_argument("command", nargs=argparse.REMAINDER)
     v = sub.add_parser("validate"); v.add_argument("files", nargs="+")
     sub.add_parser("init-branch")
     i = sub.add_parser("init", help="set up a new office")
