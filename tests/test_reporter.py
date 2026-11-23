@@ -165,10 +165,11 @@ class FakeServer(unittest.TestCase):
     def files(self):
         return json.loads(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/dump").read())
 
-    def cli(self, *args):
+    def cli(self, *args, extra=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith("GATHERLANE_")}
         env.update(GATHERLANE_API=f"http://127.0.0.1:{self.port}", GATHERLANE_TOKEN="t", GATHERLANE_REPO="o/r",
                    GATHERLANE_TZ="UTC", GATHERLANE_ENV=os.devnull)
+        env.update(extra or {})
         return subprocess.run([sys.executable, TOOL, *args], env=env, capture_output=True, text=True)
 
 
@@ -237,6 +238,201 @@ class CLI(FakeServer):
         marker = os.path.join(tempfile.mkdtemp(), "ran")
         self.assertEqual(self.cli("run", "--agent", "acme/social", "--", sys.executable, "-c", f"open({marker!r},'w')").returncode, 0)
         self.assertFalse(os.path.exists(marker))
+
+
+FAKE_PUNK = """#!{python}
+# A stand-in for punk: records its argv, whether it saw the writer token and every status on the
+# fake server at that moment, then exits with FAKE_PUNK_START or FAKE_PUNK_END (default 0).
+import json, os, sys, urllib.request
+dump = json.loads(urllib.request.urlopen(os.environ["FAKE_PUNK_DUMP"]).read())
+with open(os.environ["FAKE_PUNK_LOG"], "a") as f:
+    f.write(json.dumps({{"argv": sys.argv[1:], "token": "GATHERLANE_TOKEN" in os.environ,
+                        "statuses": {{k: v.get("status") for k, v in dump.items()}}}}) + "\\n")
+step = sys.argv[4] if len(sys.argv) > 4 else ""
+sys.exit(int(os.environ.get("FAKE_PUNK_" + step.upper(), "0")))
+"""
+
+
+class RunMemoryPunk(FakeServer):
+    """run --memory punk, with a fake punk on PATH that records each call."""
+    def setUp(self):
+        super().setUp()
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        self.bin, self.nobin, self.log = os.path.join(d, "bin"), os.path.join(d, "nobin"), os.path.join(d, "calls.jsonl")
+        self.project = os.path.join(d, "project")
+        for p in (self.bin, self.nobin, self.project):
+            os.mkdir(p)
+        punk = os.path.join(self.bin, "punk")
+        with open(punk, "w") as f:
+            f.write(FAKE_PUNK.format(python=sys.executable))
+        os.chmod(punk, 0o755)
+        self.cli("report", "--agent", "acme/job", "--status", "not_deployed", "--new")
+
+    def run_agent(self, *args, agent="acme/job", code="pass", memory=True, path=None, **settings):
+        """`run` with a command that logs itself to the same file as punk, then runs `code`."""
+        extra = {"PATH": path or self.bin, "FAKE_PUNK_LOG": self.log, "FAKE_PUNK_DUMP": f"http://127.0.0.1:{self.port}/dump",
+                 "GATHERLANE_PUNK_PROJECTS": f"{agent}={self.project}"}
+        extra.update(settings)
+        extra = {k: v for k, v in extra.items() if v is not None}
+        cmd = f"open({self.log!r},'a').write('{{\"agent\": true}}\\n');{code}"
+        return self.cli("run", "--agent", agent, *(["--memory", "punk"] if memory else []), *args,
+                        "--", sys.executable, "-c", cmd, extra=extra)
+
+    def calls(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as f:
+            return [json.loads(line) for line in f]
+
+    def steps(self):
+        return [c["argv"][3] if "argv" in c else "agent" for c in self.calls()]
+
+    def status(self, agent="acme/job"):
+        return self.files()[gl.path_of(agent)]
+
+    def punk_lines(self, r):
+        return [l for l in r.stderr.splitlines() if l.startswith("gatherlane:")]
+
+    def test_start_then_agent_then_end_with_agent_and_project(self):
+        r = self.run_agent()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.steps(), ["start", "agent", "end"])
+        start, _, end = self.calls()
+        self.assertEqual(start["argv"], ["--agent", "acme/job", "session", "start", "--project", self.project])
+        self.assertEqual(end["argv"], ["--agent", "acme/job", "session", "end", "--project", self.project])
+        # punk starts only after `run` passed the pause check and reported running, and never sees the token
+        self.assertEqual((start["statuses"]["status/acme/job.json"], end["statuses"]["status/acme/job.json"]), ("running", "running"))
+        self.assertEqual((start["token"], end["token"]), (False, False))
+        self.assertEqual(self.status()["status"], "idle")
+        self.assertEqual(self.punk_lines(r), [])  # exit 0 is quiet: punk prints its own warnings
+
+    def test_paused_agent_gets_no_punk(self):
+        self.cli("report", "--agent", "acme/social", "--status", "idle", "--new")
+        r = self.run_agent(agent="acme/social")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("paused: holiday; not running", r.stdout)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.punk_lines(r), [])
+        self.assertEqual(self.status("acme/social")["status"], "idle")
+
+    def test_end_runs_when_the_agent_fails(self):
+        r = self.run_agent(code="raise SystemExit(7)")
+        self.assertEqual(r.returncode, 7)
+        self.assertEqual(self.steps(), ["start", "agent", "end"])
+        rec = self.status()
+        self.assertEqual((rec["status"], rec["needs_human_reason"]), ("failed", "exit code 7"))
+
+    def test_end_runs_when_the_command_cannot_start(self):
+        extra = {"PATH": self.bin, "FAKE_PUNK_LOG": self.log, "FAKE_PUNK_DUMP": f"http://127.0.0.1:{self.port}/dump",
+                 "GATHERLANE_PUNK_PROJECTS": f"acme/job={self.project}"}
+        r = self.cli("run", "--agent", "acme/job", "--memory", "punk", "--", os.path.join(self.nobin, "missing"), extra=extra)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.steps(), ["start", "end"])
+
+    def test_punk_failures_leave_exit_code_and_status_alone(self):
+        for punk_rc, line in (("1", "failed (exit 1), ignored"), ("2", "needs a person (exit 2): run `punk status`")):
+            for code, want_rc, want_status in (("pass", 0, "idle"), ("raise SystemExit(3)", 3, "failed")):
+                with self.subTest(punk=punk_rc, agent=want_rc):
+                    os.path.exists(self.log) and os.unlink(self.log)
+                    r = self.run_agent(code=code, FAKE_PUNK_START=punk_rc, FAKE_PUNK_END=punk_rc)
+                    self.assertEqual(r.returncode, want_rc, r.stderr)
+                    self.assertEqual(self.steps(), ["start", "agent", "end"])
+                    self.assertEqual(self.status()["status"], want_status)
+                    lines = self.punk_lines(r)
+                    self.assertEqual(len(lines), 2, lines)
+                    self.assertIn("punk session start " + line, lines[0])
+                    self.assertIn("punk session end " + line, lines[1])
+
+    def test_punk_missing_runs_anyway(self):
+        r = self.run_agent(path=self.nobin, code="raise SystemExit(4)")
+        self.assertEqual(r.returncode, 4)
+        self.assertEqual(self.steps(), ["agent"])
+        self.assertEqual(self.punk_lines(r), ["gatherlane: --memory punk: punk is not on PATH; running without punk"])
+        self.assertEqual(self.status()["status"], "failed")
+
+    def test_bad_id_skips_punk(self):
+        for bad in ("acme/job!", "acme/" + "x" * 124):  # 128 characters fits punk's pattern, 129 does not
+            with self.subTest(bad=bad):
+                os.path.exists(self.log) and os.unlink(self.log)
+                self.cli("report", "--agent", bad, "--status", "not_deployed", "--new")
+                r = self.run_agent(agent=bad)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(self.steps(), ["agent"])
+                lines = self.punk_lines(r)
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn("is not a punk agent id", lines[0])
+                self.assertEqual(self.status(bad)["status"], "idle")
+        ok = "acme/" + "x" * 123
+        self.cli("report", "--agent", ok, "--status", "not_deployed", "--new")
+        os.unlink(self.log)
+        self.assertEqual(self.run_agent(agent=ok).returncode, 0)
+        self.assertEqual(self.steps(), ["start", "agent", "end"])
+
+    def test_missing_project_setting_runs_anyway(self):
+        for setting in (None, "", "acme/other=/srv/x", f"acme/job={self.project},acme/job=/srv/elsewhere"):
+            with self.subTest(setting=setting):
+                os.path.exists(self.log) and os.unlink(self.log)
+                r = self.run_agent(code="raise SystemExit(6)", GATHERLANE_PUNK_PROJECTS=setting)
+                self.assertEqual(r.returncode, 6)
+                self.assertEqual(self.steps(), ["agent"])
+                lines = self.punk_lines(r)
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn("listed twice" if setting and "elsewhere" in setting else "no project directory", lines[0])
+                self.assertEqual(self.status()["status"], "failed")
+
+    def test_project_setting_from_the_env_file(self):
+        envf = os.path.join(self.project, "env")
+        with open(envf, "w") as f:
+            f.write(f"export GATHERLANE_PUNK_PROJECTS='acme/other=/srv/other, acme/job={self.project}'\n")
+        r = self.run_agent(GATHERLANE_PUNK_PROJECTS=None, GATHERLANE_ENV=envf)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls()[0]["argv"][-1], self.project)
+
+    def test_skip_on_start_failure(self):
+        r = self.run_agent(FAKE_PUNK_START="2", GATHERLANE_PUNK_SKIP_ON_START_FAILURE="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.steps(), ["start"])  # neither the agent nor session end
+        rec = self.status()
+        self.assertEqual((rec["status"], rec["last_result"], rec["needs_human"]), ("blocked", "skipped", False))
+        self.assertEqual(rec["needs_human_reason"],
+                         "punk session start failed (exit 2); run skipped (GATHERLANE_PUNK_SKIP_ON_START_FAILURE=1)")
+        self.assertIsNone(rec["current_task"])
+
+    def test_skip_on_start_failure_only_when_set_and_start_failed(self):
+        for settings, want in (({"FAKE_PUNK_START": "1"}, ["start", "agent", "end"]),
+                               ({"FAKE_PUNK_START": "1", "GATHERLANE_PUNK_SKIP_ON_START_FAILURE": "0"}, ["start", "agent", "end"]),
+                               ({"GATHERLANE_PUNK_SKIP_ON_START_FAILURE": "1"}, ["start", "agent", "end"]),
+                               ({"GATHERLANE_PUNK_SKIP_ON_START_FAILURE": "1", "path": "nobin"}, ["agent"])):
+            with self.subTest(settings=settings):
+                os.path.exists(self.log) and os.unlink(self.log)
+                if settings.get("path"):
+                    settings = {**settings, "path": self.nobin}
+                r = self.run_agent(**settings)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(self.steps(), want)
+                self.assertEqual(self.status()["status"], "idle")
+
+    def test_without_memory_nothing_changes(self):
+        r = self.run_agent(memory=False, FAKE_PUNK_START="2", GATHERLANE_PUNK_SKIP_ON_START_FAILURE="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.steps(), ["agent"])
+        self.assertEqual((r.stdout, r.stderr), ("status/acme/job.json: running\nstatus/acme/job.json: idle\n", ""))
+        self.assertEqual(self.status()["status"], "idle")
+
+    def test_unknown_id_runs_without_punk(self):
+        r = self.run_agent(agent="acme/typo", code="raise SystemExit(5)")
+        self.assertEqual(r.returncode, 5)
+        self.assertEqual(self.steps(), ["agent"])
+        self.assertIn("Running the command without reporting.", r.stderr)
+        self.assertEqual(self.punk_lines(r), ["gatherlane: --memory punk: no punk session for an id without a status file; running without punk"])
+        self.assertNotIn("status/acme/typo.json", self.files())
+
+
+class PunkProjects(EnvCase):
+    def test_pairs_spaces_home_and_duplicates(self):
+        os.environ["GATHERLANE_PUNK_PROJECTS"] = " a/x = /srv/x ,b/y=~/y,broken,=z,c/z=/1,c/z=/2,d/w=/w,d/w=/w"
+        self.assertEqual(gl.punk_projects(), {"a/x": "/srv/x", "b/y": os.path.expanduser("~/y"), "c/z": None, "d/w": "/w"})
 
 
 class Init(FakeServer):

@@ -12,13 +12,24 @@ Environment (each may also be set as `export NAME=value` in the env file, see GA
   GATHERLANE_OPS     id prefixes that share an operation, e.g. "web=acme,orchestrator=shared".
                      Otherwise an id's first part is its operation ("acme/support" -> acme), and an
                      id without a slash goes to "shared".
+  GATHERLANE_PUNK_PROJECTS
+                     for `run --memory punk`: each agent's project directory, as comma separated
+                     ID=DIR pairs, e.g. "acme/web=/srv/agents/web,acme/api=/srv/agents/api"
+  GATHERLANE_PUNK_SKIP_ON_START_FAILURE
+                     1: with --memory punk, skip the command when `punk session start` fails, and
+                     report blocked with last_result skipped. Otherwise the command runs anyway.
   GATHERLANE_ENV     file read for any of the above not already set, default ~/.config/gatherlane/env
 
 Commands
-  run          --agent ID [--cron EXPR] [--runbook URL] [--workflow URL] -- COMMAND ...
+  run          --agent ID [--cron EXPR] [--runbook URL] [--workflow URL] [--memory punk] -- COMMAND ...
                check pause → report running → run COMMAND → report idle/sleeping/failed/waiting.
                COMMAND may write JSON to the file named in $GATHERLANE_OUT to ask for a human:
                  {"needs_human_kind": "escalation", "reason": "...", "issue": "https://..."}
+               --memory punk: run `punk --agent ID session start --project DIR` before COMMAND and
+               `punk --agent ID session end --project DIR` after it, DIR from GATHERLANE_PUNK_PROJECTS.
+               Only an agent that is not paused and has a status file gets them. A punk result is
+               logged and never changes the exit code or the reported status
+               (examples/punk-records.md).
   report       --agent ID --status STATUS [fields...]   write/merge one status file; an id with no
                                                         file yet needs --new (catches mistyped ids)
   check-pause  --agent ID                               exit 3 if paused, 0 otherwise
@@ -29,7 +40,7 @@ Commands
                app/instance/ (generated building, SAMPLE data), register the agents as
                not_deployed, add the settings to the env file, and print the remaining steps
 """
-import argparse, base64, datetime as dt, json, os, re, shlex, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
+import argparse, base64, datetime as dt, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
 from zoneinfo import ZoneInfo
 
 SCHEMA = "gatherlane.agent-status/v1"
@@ -286,6 +297,66 @@ def ns(**kw):
     return argparse.Namespace(**base)
 
 
+# ---------- run --memory punk: Punk Records sessions around the command ----------
+PUNK_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,127}"  # punk's own pattern for --agent
+
+
+def log(msg):
+    print(f"gatherlane: {msg}", file=sys.stderr)
+
+
+def punk_projects():
+    """GATHERLANE_PUNK_PROJECTS as {id: dir}. An id listed twice with different dirs maps to None."""
+    out = {}
+    for pair in (env("GATHERLANE_PUNK_PROJECTS", "") or "").split(","):
+        if "=" in pair:
+            k, v = (s.strip() for s in pair.split("=", 1))
+            if k and v:
+                v = os.path.expanduser(v)
+                out[k] = v if k not in out or out[k] == v else None
+    return out
+
+
+def punk_project(agent):
+    """The project directory for `punk session`, or None after one log line saying why not."""
+    if not re.fullmatch(PUNK_ID_RE, agent):
+        log(f"--memory punk: {agent!r} is not a punk agent id (letters, digits and . _ / @ : + -, starting with "
+            f"a letter or digit, at most 128 characters); running without punk")
+        return None
+    projects = punk_projects()
+    if agent not in projects:
+        log(f"--memory punk: no project directory for {agent} in GATHERLANE_PUNK_PROJECTS; running without punk")
+        return None
+    if projects[agent] is None:
+        log(f"--memory punk: {agent} is listed twice in GATHERLANE_PUNK_PROJECTS with different directories; "
+            f"running without punk")
+        return None
+    if not shutil.which("punk"):
+        log("--memory punk: punk is not on PATH; running without punk")
+        return None
+    return projects[agent]
+
+
+def punk_session(step, agent, project):
+    """Run `punk --agent AGENT session STEP --project PROJECT` and log any failure. Returns punk's exit
+    code, or 127 when punk could not be started. Never raises for a punk problem."""
+    penv = {k: v for k, v in os.environ.items() if k != "GATHERLANE_TOKEN"}  # punk has no use for the writer token
+    try:
+        rc = subprocess.call(["punk", "--agent", agent, "session", step, "--project", project], env=penv,
+                             stdin=subprocess.DEVNULL)
+    except OSError as e:
+        log(f"punk session {step} could not start ({e}), ignored")
+        return 127
+    if rc == 2:
+        log(f"punk session {step} needs a person (exit 2): run `punk status`, and `punk diff <satellite> <path>` "
+            f"for a conflict; a punk older than 0.6.0 also exits 2, see `punk --version`")
+    elif rc < 0:
+        log(f"punk session {step} was stopped by signal {-rc}, ignored")
+    elif rc:
+        log(f"punk session {step} failed (exit {rc}), ignored")
+    return rc
+
+
 def cmd_run(a):
     cmd = a.command[1:] if a.command and a.command[0] == "--" else a.command
     if not cmd:
@@ -296,6 +367,8 @@ def cmd_run(a):
     cmd_env = {**os.environ, "GATHERLANE_OUT": out, "GATHERLANE_AGENT": a.agent}
     if read_file(path_of(a.agent))[0] is None:  # a mistyped id must not stop the agent's own work
         print(unknown_agent(a.agent, path_of(a.agent)) + " Running the command without reporting.", file=sys.stderr)
+        if a.memory:  # no pause check runs for this id, and a mistyped id must not sign commits in the store
+            log("--memory punk: no punk session for an id without a status file; running without punk")
         sys.exit(subprocess.call(cmd, env=cmd_env))
     p = paused(a.agent)
     if p:
@@ -308,7 +381,19 @@ def cmd_run(a):
         cmd_report(ns(status=keep, **common))
         return
     cmd_report(ns(status="running", last_run_at="now", task=a.task, **common))
-    code = subprocess.call(cmd, env=cmd_env)
+    project = punk_project(a.agent) if a.memory else None
+    if project is not None:
+        rc = punk_session("start", a.agent, project)
+        if rc and env("GATHERLANE_PUNK_SKIP_ON_START_FAILURE") == "1":
+            reason = f"punk session start failed (exit {rc}); run skipped (GATHERLANE_PUNK_SKIP_ON_START_FAILURE=1)"
+            log(reason)
+            cmd_report(ns(status="blocked", last_result="skipped", task="", reason=reason, **common))
+            return
+    try:
+        code = subprocess.call(cmd, env=cmd_env)
+    finally:
+        if project is not None:
+            punk_session("end", a.agent, project)
     ask = {}
     try:
         txt = open(out).read().strip()
@@ -531,7 +616,9 @@ def main():
     c = sub.add_parser("check-pause"); c.add_argument("--agent", required=True)
     u = sub.add_parser("run")
     u.add_argument("--agent", required=True); u.add_argument("--cron"); u.add_argument("--task")
-    u.add_argument("--runbook"); u.add_argument("--workflow"); u.add_argument("command", nargs=argparse.REMAINDER)
+    u.add_argument("--runbook"); u.add_argument("--workflow")
+    u.add_argument("--memory", choices=["punk"], help="Punk Records session start and end around the command")
+    u.add_argument("command", nargs=argparse.REMAINDER)
     v = sub.add_parser("validate"); v.add_argument("files", nargs="+")
     sub.add_parser("init-branch")
     i = sub.add_parser("init", help="set up a new office")
