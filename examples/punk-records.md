@@ -65,7 +65,8 @@ the store records that name in `satellites/<satellite id>.json`:
   B's store first, while its agent is not running:
 
   ```sh
-  mv ~/.punk-records ~/.punk-records.aside       # the store folder; PUNK_HOME if you set one
+  cd                                             # the store is .punk-records in the home folder
+  mv .punk-records .punk-records.aside           # or the PUNK_HOME folder, if you set one
   punk init --no-global <private store remote>   # clones A's store this time
   punk track /srv/agents/web-app
   ```
