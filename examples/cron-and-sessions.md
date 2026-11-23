@@ -30,6 +30,9 @@ env file and the same prefixes to `agentPrefixes` in `config.js`.
 */15 * * * * . ~/.config/gatherlane/env && python3 ~/gatherlane/tools/gatherlane.py run --agent <operation>/support-agent --cron "*/15 * * * *" -- /opt/agent-runner/run.sh support-agent >> ~/logs/support-agent.log 2>&1
 ```
 
+To carry an agent's memory files from one run to the next, wrap the same line in `punk-run`
+from [punk-records.md](punk-records.md). It is optional; without it nothing here changes.
+
 If the agent is started over HTTP (for example `POST /agents/{name}/run`), wrap the curl call
 instead of the script. A runner's own kill switch still applies; `control/pause.json` is the
 switch you can flip from your phone.
@@ -73,6 +76,9 @@ If the agent file has a Rules list, add one bullet to it so the agent treats rep
 ```md
 - **Report to Gatherlane on every run**, as "Gatherlane status" below describes.
 ```
+
+For memory between sessions, the Punk Records plugin and a short "Memory" section to put next
+to "Gatherlane status" are in [punk-records.md](punk-records.md).
 
 A line in the repo's `CLAUDE.md` saying what Gatherlane is, and where the reporter and its token
 live, helps the main session as well.
