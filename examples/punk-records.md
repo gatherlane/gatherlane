@@ -52,16 +52,41 @@ punk track --id acme/finance /srv/agents/finance
 No first `punk sync` is needed, even when the remote is empty: `session start` against an empty
 remote restores from the local store and exits 0, and the first `session end` pushes and creates
 `main` on the remote. Set up the first host and let one of its agents run once before you run
-`punk init <remote>` on the next host, so the next host clones that store. Two hosts that both
-run `punk init` while the remote is still empty each start a store of their own, with unrelated
-histories: the second host's runs still exit 0, but every one logs
-`could not merge origin main` and its memory never reaches the remote. To fix such a host, move
-its store folder aside and run `punk init --no-global <remote>` and `punk track` there again.
+`punk init <remote>` on the next host, so the next host clones that store.
+
+**Two hosts that both ran `punk init` while the remote was still empty** each start a store of
+their own, with unrelated histories. Say host A's agent ran first and pushed; what host B does next
+depends on the name of the project's folder (its last part, `web` in `/srv/agents/web`), because
+the store records that name in `satellites/<satellite id>.json`:
+
+- **Different folder names** (for example `/srv/agents/web` on A and `/srv/agents/web-app` on B):
+  the two satellite files disagree, so B cannot pull. Every run on B exits 0 but logs
+  `could not merge origin main` at start and at end, and B's memory never reaches the remote. Fix
+  B's store first, while its agent is not running:
+
+  ```sh
+  mv ~/.punk-records ~/.punk-records.aside       # the store folder; PUNK_HOME if you set one
+  punk init --no-global <private store remote>   # clones A's store this time
+  punk track /srv/agents/web-app
+  ```
+
+  After that B pulls, but every run on B exits 2 with
+  `punk: conflict github.com/acme/web/CLAUDE.md`: the store now holds A's copy and B's project
+  still holds its own. Settle it as in "Settling a conflict" in section 3.
+- **The same folder name**: B's pull succeeds and its store takes A's history, so there is no
+  `could not merge` line and nothing to move aside. From its first run every run on B exits 2 with
+  the same `punk: conflict github.com/acme/web/CLAUDE.md`. Settle it the same way.
+
+Either way the conflict stays, and B's memory stays off the remote, until a person settles it.
 
 Memory files say a lot about your projects. Keep the store's remote private. If it must live
 somewhere you do not fully trust, use `punk encrypt` instead: the remote then holds only one
 age-encrypted file. `session start` and `session end` pull and push through the same code as
-`punk sync`, which uses the encrypted remote when one is set up (it needs `age` on `PATH`):
+`punk sync`, which uses the encrypted remote when one is set up. That needs `age` on `PATH`, cron's
+`PATH` included (section 3). Without it, `session start` and `session end` exit 1 with
+`[Errno 2] No such file or directory: 'age'`. `session start` then restores nothing, and
+`session end` has saved into the local store but pushes nothing: a missing `age` does not fall
+back to the local store the way an unreachable remote does.
 
 ```sh
 punk init --no-global
@@ -123,8 +148,9 @@ exit $?
 ```
 
 And the cron line, in place of the plain `run` line. Cron's `PATH` is short, so name the folder
-that holds `punk` (in a login shell, `dirname "$(command -v punk)"` prints it), and call the
-wrapper by its full path:
+that holds `punk` (in a login shell, `dirname "$(command -v punk)"` prints it), and, for an
+encrypted store, the folder that holds `age` too when it is not already one of those listed
+(`dirname "$(command -v age)"`). Call the wrapper by its full path:
 
 ```cron
 PATH=<folder that holds punk>:/usr/local/bin:/usr/bin:/bin
@@ -135,9 +161,11 @@ PATH=<folder that holds punk>:/usr/local/bin:/usr/bin:/bin
 What happens on each run:
 
 1. `gatherlane.py run` checks the pause flag. A paused agent stops here: `run` prints
-   `paused: <reason>; not running`, reports the agent at rest (never `running`) and exits 0, and
-   neither `session start` nor `session end` runs, so nothing is restored into the project or
-   saved from it.
+   `paused: <reason>; not running` and exits 0. It never reports `running`. An agent whose last
+   status was `waiting` is not reported at all, so its request to a person stays as it was; any
+   other agent is reported again with its last status if that was `idle`, `sleeping`, `blocked`
+   or `failed`, and as `idle` otherwise. Neither `session start` nor `session end` runs, so
+   nothing is restored into the project or saved from it.
 2. Otherwise `run` reports `running` and starts `punk-run --inside`, which runs
    `punk --agent <operation>/<agent> session start --project <dir>`: pull, then restore.
 3. The agent command runs, whatever `session start` returned.
@@ -152,14 +180,15 @@ The wrapper's only log lines are these; `punk` adds its own lines just before th
 | Log line | Meaning |
 |---|---|
 | `punk not on PATH, skipped: session <step>` | `punk` is not installed, or not on cron's `PATH` |
-| `session <step> failed (exit 1), ignored` | `punk` could not run: no store, the project is not tracked here, or the store stayed busy for `PUNK_LOCK_TIMEOUT` |
+| `session <step> failed (exit 1), ignored` | `punk` could not run: no store, the project is not tracked here, the store stayed busy for `PUNK_LOCK_TIMEOUT`, or `age` missing (encrypted store, section 2) |
 | `session <step> needs a person (exit 2): ...` | a conflict or a file blocked as a possible secret; local files are left alone. In 0.6.0 also a usage error, see section 6 |
 
 `punk` also prints a warning and still exits 0 when it cannot reach the remote:
 `punk: could not reach the remote (...); using the local store` at start, and
 `punk: saved locally but could not sync (...)` at end. Memory then stays on this host until a
 later run reaches the remote, so look for those lines in the agent's log if memory stops moving
-between hosts.
+between hosts. A missing `age` for an encrypted store is not one of these: it exits 1 (see the
+table and section 2).
 
 **Several agents on one host.** Every `punk` command that changes the store holds its lock
 (`.git/punk.lock` inside the store) and waits up to 60 seconds for another one to finish
@@ -188,11 +217,25 @@ remote can hang, bound it in the store's own ssh settings (for example
 than by stopping `punk` partway through a save.
 
 **Settling a conflict.** When `session start` or `session end` exits 2 for a conflict, both copies
-are left alone. Look with `punk status` and `punk diff <satellite> <path>`, then settle it with
-`punk save --force <satellite>` (local wins) or `punk restore --force <satellite>` (the store wins,
-the local copy kept as `.punk-bak`), at a time when that agent is not running. Two hosts adding
-lines to the same memory file are not a conflict: the store merges them and keeps both sides'
-lines.
+are left alone. Look with `punk status` and `punk diff <satellite> <path>`, and settle it at a
+time when that agent is not running. `punk save --force <satellite>` keeps only the local copy and
+`punk restore --force <satellite>` keeps only the store's copy (the local one kept as
+`.punk-bak`); each drops the other side's lines. To keep both, take the store's copy, then add back
+the local lines it lacks, for each file `punk status` names (here `CLAUDE.md` of
+`github.com/acme/web`):
+
+```sh
+cd /srv/agents/web                                      # the project folder on this host
+punk restore --force github.com/acme/web                # keeps the local copy as CLAUDE.md.punk-bak
+grep -vxF -f CLAUDE.md CLAUDE.md.punk-bak >> CLAUDE.md  # add back this host's lines the store lacks
+rm CLAUDE.md.punk-bak
+```
+
+The next `session end` saves the file with both sides' lines and pushes it, and the runs after it
+exit 0. This suits memory files that are lists of lines, as most are. The local lines land at the
+end of the file, so where order matters, edit the file by hand from the `.punk-bak` copy before
+you delete it. Two hosts adding lines to the same memory file, once they share a store, are not a
+conflict: the store merges them and keeps both sides' lines.
 
 ## 4. Claude Code subagents and orchestrators
 
@@ -206,12 +249,12 @@ when it is tracked), not on every satellite. Install it once per machine, in Cla
 /plugin install punk-records@punk-records
 ```
 
-These two steps work in every Claude Code version. Newer versions also take the one-step shortcut
-`/plugin install punk-records --marketplace gablooge/punk-records`. The plugin needs `punk` on
-`PATH` and a store from section 2. The hooks run per Claude Code session, not per subagent: a
-subagent sees what its session restored, and its changes are saved when the session ends. Their
-commits carry a `Punk-Agent` trailer only if `PUNK_AGENT` is set in the environment Claude Code
-starts with.
+These two steps work in every Claude Code version with plugins. Newer versions also take the
+one-step shortcut `/plugin install punk-records --marketplace gablooge/punk-records`. The plugin
+needs `punk` on `PATH` and a store from section 2. The hooks run per Claude Code session, not per
+subagent: a subagent sees what its session restored, and its changes are saved when the session
+ends. Their commits carry a `Punk-Agent` trailer only if `PUNK_AGENT` is set in the environment
+Claude Code starts with.
 
 Next to the "Gatherlane status" section you appended to each `.claude/agents/<agent>.md` (see
 [cron-and-sessions.md](cron-and-sessions.md)), add:
