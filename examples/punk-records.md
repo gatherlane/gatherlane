@@ -158,6 +158,13 @@ a session of its own (`setsid`) is out of the group's reach. A later run's `sess
 project again after a save cut short this way, but give a slow remote enough time rather than
 rely on the limit (see "No time limit on the remote" below).
 
+Because `punk` has a process group of its own, a signal to the group of `run` (Ctrl-C, GNU
+`timeout`, `kill -TERM -<pgid>`, a supervisor stopping the job) reaches `run` and not `punk`. So
+while a step runs, `run` catches SIGINT, SIGTERM and SIGHUP, stops `punk` and its group the same
+way, and then ends by that signal, as it would without `--memory`: it reports nothing more, so the
+status file keeps `running` from the start of the run. A SIGHUP that is already ignored (`nohup`)
+stays ignored.
+
 A `punk` result never changes `run`'s exit code or the reported status. `run` adds at most one
 line per step to the log, each starting with `gatherlane:`, after `punk`'s own lines:
 
@@ -178,14 +185,16 @@ command runs as usual:
 | `--memory punk: '<id>' is not a punk agent id ...` | the id is not one line of letters, digits and `. _ / @ : + -` starting with a letter or digit, at most 128 characters, the pattern `punk` itself checks. `run` checks it first because `punk` 0.6.0 reports a bad id with exit 2, the same code as a conflict |
 | `--memory punk: no project directory for <id> in GATHERLANE_PUNK_PROJECTS; ...` | the setting is missing, or does not name this agent |
 | `--memory punk: <id> is listed twice in GATHERLANE_PUNK_PROJECTS with different directories; ...` | one id, two directories: `run` does not guess which one |
-| `--memory punk: the GATHERLANE_PUNK_PROJECTS entry for <id> is followed by ',<text>', which is not an <id>=<dir> pair ...` | the directory seems to contain a comma (`a/x=/srv/one,two`); `run` does not cut it at the comma |
+| `--memory punk: the GATHERLANE_PUNK_PROJECTS entry for <id> is followed by ',<text>', which is not an <id>=<dir> pair ...` | the directory seems to contain a comma (`a/x=/srv/one,two`, or `a/x=/srv/one,/two=b` where no punk id comes before the `=`); `run` does not cut it at the comma |
 | `--memory punk: the GATHERLANE_PUNK_PROJECTS directory for <id> is not an absolute path (...); ...` | a relative directory, or one that starts with `-` or with `~name` for a user that does not exist |
 | `--memory punk: punk is not on PATH; ...` | `punk` is not installed, or not on cron's `PATH` |
 | `--memory punk: no punk session for an id without a status file; ...` | the id has no status file yet, so `run` runs the command without reporting, as it always has, and without `punk` too: `run` does not check the pause flag for such an id, and a mistyped id would sign commits in the store with the wrong `Punk-Agent` |
 
 `GATHERLANE_PUNK_PROJECTS` entries are split at the first `=`; spaces around each part are
 ignored and a leading `~` is expanded. A directory cannot contain a comma. An agent id never
-contains `,` or `=`, so the setting cannot be read two ways.
+contains `,` or `=`, so the setting cannot be read two ways. One case `run` cannot tell from two
+entries: a comma followed by text that is itself a valid pair (`a/x=/srv/one,v2=x` reads as `a/x`
+in `/srv/one` and `v2` in `x`), so keep commas out of the directory names.
 
 **Skipping the run when `session start` fails.** By default the agent runs even when
 `session start` exits 1 or 2, so an agent never stops working because of its memory. To skip the
