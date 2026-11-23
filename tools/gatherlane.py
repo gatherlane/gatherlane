@@ -44,7 +44,7 @@ Commands
                app/instance/ (generated building, SAMPLE data), register the agents as
                not_deployed, add the settings to the env file, and print the remaining steps
 """
-import argparse, base64, datetime as dt, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
+import argparse, base64, contextlib, datetime as dt, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
 from zoneinfo import ZoneInfo
 
 SCHEMA = "gatherlane.agent-status/v1"
@@ -311,16 +311,17 @@ def log(msg):
 
 def punk_projects():
     """GATHERLANE_PUNK_PROJECTS as ({id: dir}, {id: why its entry cannot be used}). An id listed twice
-    with different dirs, or whose dir is followed by a part that is not a pair, goes to the second."""
+    with different dirs, or whose dir is followed by a part that is not a pair with a punk id before
+    its `=`, goes to the second."""
     dirs, problems, last = {}, {}, None
     for part in (env("GATHERLANE_PUNK_PROJECTS", "") or "").split(","):
-        if "=" not in part:
+        k, v = (x.strip() for x in part.split("=", 1)) if "=" in part else (None, None)
+        if k is None or not re.fullmatch(PUNK_ID_RE, k):  # not a pair, or no punk id before the `=`
             if part.strip() and last is not None and last not in problems:  # the dir held a comma
                 problems[last] = (f"the GATHERLANE_PUNK_PROJECTS entry for {last} is followed by {',' + part.strip()!r}, "
                                   f"which is not an <id>=<dir> pair (a directory cannot contain a comma)")
                 dirs.pop(last, None)
             continue
-        k, v = (x.strip() for x in part.split("=", 1))
         last = k if k and v else None
         if last is None or k in problems:
             continue
@@ -397,6 +398,46 @@ def punk_stop(p):
         p.wait()
 
 
+class PunkSignal(BaseException):
+    """SIGTERM or SIGHUP arrived while a punk step ran (see punk_guard)."""
+
+
+@contextlib.contextmanager
+def punk_guard(p):
+    """Around a running punk step: if anything interrupts it (Ctrl-C, or SIGTERM or SIGHUP, which raise
+    PunkSignal here), stop punk's process group first, since punk has its own and a signal to the group
+    of `run` never reaches it. After a SIGTERM or SIGHUP `run` then ends by that same signal. A signal
+    whose handler is not the default (nohup's ignored SIGHUP, say) is left alone, and a second signal
+    while punk is being stopped does not cut that short."""
+    got, prev = [], {}
+
+    def on_signal(signum, frame):
+        if not got:
+            got.append(signum)
+            raise PunkSignal(signum)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        try:
+            if sig is not None and signal.getsignal(sig) == signal.SIG_DFL:
+                prev[sig] = signal.signal(sig, on_signal)
+        except ValueError:  # not the main thread: no handlers, as before
+            pass
+    try:
+        try:
+            yield
+        except BaseException:
+            punk_stop(p)
+            if not got:
+                raise
+    finally:
+        for sig, handler in prev.items():
+            signal.signal(sig, handler)
+    if got:  # punk is stopped: end the way the signal would have ended `run`
+        os.kill(os.getpid(), got[0])
+        sys.exit(128 + got[0])  # only reached if the signal did not end the process
+
+
 def punk_session(step, agent, project, timeout, quiet=False):
     """Run `punk --agent AGENT session STEP --project PROJECT` for at most `timeout` seconds. Returns None
     when punk exited 0, otherwise what happened ("failed (exit 1)", "timed out after ..."), which is
@@ -408,17 +449,15 @@ def punk_session(step, agent, project, timeout, quiet=False):
     except OSError as e:
         what = f"could not start ({e})"
     else:
-        try:
-            rc = p.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            punk_stop(p)
-            what = f"timed out after {timeout:g} seconds and was stopped"
-        except BaseException:  # Ctrl-C: punk has its own process group, so the terminal's signal missed it
-            punk_stop(p)
-            raise
-        else:
-            what = (None if rc == 0 else "needs a person (exit 2)" if rc == 2 else
-                    f"was stopped by signal {-rc}" if rc < 0 else f"failed (exit {rc})")
+        with punk_guard(p):
+            try:
+                rc = p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                punk_stop(p)
+                what = f"timed out after {timeout:g} seconds and was stopped"
+            else:
+                what = (None if rc == 0 else "needs a person (exit 2)" if rc == 2 else
+                        f"was stopped by signal {-rc}" if rc < 0 else f"failed (exit {rc})")
     if what and not quiet:
         log(f"punk session {step} {what}" + (": run `punk status`, and `punk diff <satellite> <path>` for a conflict; "
                                               "a punk older than 0.6.0 also exits 2, see `punk --version`"

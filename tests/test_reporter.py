@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Tests for tools/gatherlane.py: python3 -m unittest discover -s tests
 # Standard library only. The CLI tests run the reporter against tests/fake_github.py.
-import contextlib, datetime as dt, importlib.util, io, json, os, shutil, socket, subprocess, sys, tempfile, time, unittest, urllib.request
+import contextlib, datetime as dt, importlib.util, io, json, os, shutil, signal, socket, subprocess, sys, tempfile, time, unittest, urllib.request
 from zoneinfo import ZoneInfo
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -165,13 +165,16 @@ class FakeServer(unittest.TestCase):
     def files(self):
         return json.loads(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/dump").read())
 
-    def cli(self, *args, extra=None, input=None, timeout=None):
+    def cli_env(self, extra=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith("GATHERLANE_")}
         env.update(GATHERLANE_API=f"http://127.0.0.1:{self.port}", GATHERLANE_TOKEN="t", GATHERLANE_REPO="o/r",
                    GATHERLANE_TZ="UTC", GATHERLANE_ENV=os.devnull)
         env.update(extra or {})
-        return subprocess.run([sys.executable, TOOL, *args], env=env, capture_output=True, text=True, input=input,
-                              timeout=timeout)
+        return env
+
+    def cli(self, *args, extra=None, input=None, timeout=None):
+        return subprocess.run([sys.executable, TOOL, *args], env=self.cli_env(extra), capture_output=True, text=True,
+                              input=input, timeout=timeout)
 
 
 class CLI(FakeServer):
@@ -308,16 +311,45 @@ class RunMemoryPunk(FakeServer):
         os.chmod(punk, 0o755)
         self.cli("report", "--agent", "acme/job", "--status", "not_deployed", "--new")
 
-    def run_agent(self, *args, agent="acme/job", code="pass", memory=True, path=None, input=None, timeout=None,
-                  **settings):
-        """`run` with a command that logs itself to the same file as punk, then runs `code`."""
+    def run_args(self, *args, agent="acme/job", code="pass", memory=True, path=None, **settings):
+        """The argv and env of `run` with a command that logs itself to the same file as punk, then runs `code`."""
         extra = {"PATH": path or self.bin, "FAKE_PUNK_LOG": self.log, "FAKE_PUNK_DUMP": f"http://127.0.0.1:{self.port}/dump",
                  "GATHERLANE_PUNK_PROJECTS": f"{agent}={self.project}"}
         extra.update(settings)
         extra = {k: v for k, v in extra.items() if v is not None}
         cmd = f"open({self.log!r},'a').write('{{\"agent\": true}}\\n');{code}"
-        return self.cli("run", "--agent", agent, *(["--memory", "punk"] if memory else []), *args,
-                        "--", sys.executable, "-c", cmd, extra=extra, input=input, timeout=timeout)
+        return ["run", "--agent", agent, *(["--memory", "punk"] if memory else []), *args,
+                "--", sys.executable, "-c", cmd], extra
+
+    def run_agent(self, *args, input=None, timeout=None, **kw):
+        argv, extra = self.run_args(*args, **kw)
+        return self.cli(*argv, extra=extra, input=input, timeout=timeout)
+
+    def run_and_signal(self, sig, when, ignore=None, **kw):
+        """Start `run` as the leader of its own process group, wait until `when(calls)` holds, then signal that
+        group, the way GNU timeout, `kill -TERM -<pgid>` or a job supervisor does. Returns (returncode, stderr)."""
+        argv, extra = self.run_args(**kw)
+        argv = [TOOL, *argv]
+        if ignore:  # start `run` with `ignore` already ignored, as nohup does for SIGHUP
+            argv = ["-c", f"import os, signal, sys; signal.signal({int(ignore)}, signal.SIG_IGN); "
+                          "os.execv(sys.executable, [sys.executable] + sys.argv[1:])", *argv]
+        errf = os.path.join(os.path.dirname(self.log), "stderr")  # a file, not a pipe: an orphan punk would hold a pipe open
+        with open(errf, "w") as err:
+            run = subprocess.Popen([sys.executable, *argv], env=self.cli_env(extra), stdout=subprocess.DEVNULL,
+                                   stderr=err, start_new_session=True)
+        self.addCleanup(lambda: run.poll() is None and run.kill())
+        end = time.monotonic() + 30
+        while not when(self.calls()):
+            self.assertIsNone(run.poll(), "run ended before the signal")
+            self.assertLess(time.monotonic(), end, "run never reached the point to signal")
+            time.sleep(.05)
+        os.killpg(run.pid, sig)
+        try:
+            run.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail(f"run still runs 30 s after signal {sig}")
+        with open(errf) as f:
+            return run.returncode, f.read()
 
     def calls(self):
         if not os.path.exists(self.log):
@@ -561,6 +593,49 @@ class RunMemoryPunk(FakeServer):
         self.assertFalse(alive(hung["child"]), "punk's child ignored SIGTERM and still runs")
         self.assertEqual(self.status()["status"], "idle")
 
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups")
+    def test_signal_to_run_mid_step_stops_punk_and_its_child(self):
+        # punk runs in its own session, so a signal to the group of `run` reaches `run` alone: run must stop punk
+        hung = lambda calls: any("child" in c for c in calls)
+        for sig, step in ((signal.SIGTERM, "START"), (signal.SIGTERM, "END"), (signal.SIGHUP, "END"),
+                          (signal.SIGINT, "START"), (signal.SIGINT, "END")):
+            with self.subTest(sig=sig.name, step=step):
+                os.path.exists(self.log) and os.unlink(self.log)
+                self.cli("report", "--agent", "acme/job", "--status", "idle")
+                rc, err = self.run_and_signal(sig, hung, code="raise SystemExit(5)", GATHERLANE_PUNK_TIMEOUT="60",
+                                              **{"FAKE_PUNK_" + step: "hang"})
+                self.assertEqual(rc, -sig, err)  # run ends by the signal, as it would without --memory
+                p = [c for c in self.calls() if "child" in c][0]
+                self.assertFalse(alive(p["pid"]), f"punk session {step.lower()} outlived {sig.name} to run")
+                self.assertFalse(alive(p["child"]), f"the child of punk outlived {sig.name} to run")
+                # the agent ran only before an end step, and run reported nothing after the signal: no invented
+                # result, the record stays as the last report left it
+                self.assertEqual(self.steps(), ["start"] if step == "START" else ["start", "agent", "end"])
+                self.assertEqual(self.status()["status"], "running")
+                self.assertNotIn("punk session", err)  # a signal is not a punk failure to log
+                if sig != signal.SIGINT:
+                    self.assertNotIn("Traceback", err)
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups")
+    def test_an_ignored_sighup_stays_ignored(self):
+        # under nohup, SIGHUP does not stop the step: it runs on until the time limit, and run reports as usual
+        hung = lambda calls: any("child" in c for c in calls)
+        rc, err = self.run_and_signal(signal.SIGHUP, hung, ignore=signal.SIGHUP, code="raise SystemExit(5)",
+                                      GATHERLANE_PUNK_TIMEOUT="2", FAKE_PUNK_END="hang")
+        self.assertEqual(rc, 5, err)
+        self.assertEqual([l for l in err.splitlines() if l.startswith("gatherlane:")],
+                         ["gatherlane: punk session end timed out after 2 seconds and was stopped, ignored"])
+        self.assertEqual(self.status()["status"], "failed")
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups")
+    def test_signal_handlers_are_restored_after_the_step(self):
+        # SIGTERM while the agent itself runs: `run` dies at once as before, with no punk end step after it
+        started = lambda calls: any(c.get("agent") for c in calls)
+        rc, err = self.run_and_signal(signal.SIGTERM, started, code="import time; time.sleep(30)")
+        self.assertEqual(rc, -signal.SIGTERM, err)
+        self.assertEqual(self.steps(), ["start", "agent"])
+        self.assertEqual(self.status()["status"], "running")
+
     def test_timeout_setting_from_the_env_file(self):
         envf = os.path.join(self.project, "env")
         with open(envf, "w") as f:
@@ -605,6 +680,17 @@ class RunMemoryPunk(FakeServer):
         self.assertEqual(self.punk_lines(r), ["gatherlane: --memory punk: the GATHERLANE_PUNK_PROJECTS entry for acme/job "
                                               "is followed by ',two', which is not an <id>=<dir> pair (a directory cannot "
                                               "contain a comma); running without punk"])
+        # a tail that looks like a pair but has no punk id before its `=` is the same: the dir held a comma
+        for tail in ("/opt/x=y", "=y", "a b=y", "-x=y"):
+            with self.subTest(tail=tail):
+                os.unlink(self.log)
+                r = self.run_agent(code="raise SystemExit(6)", GATHERLANE_PUNK_PROJECTS=f"acme/job={self.project},{tail}")
+                self.assertEqual(r.returncode, 6, r.stderr)
+                self.assertEqual(self.steps(), ["agent"])
+                self.assertEqual(self.punk_lines(r), [f"gatherlane: --memory punk: the GATHERLANE_PUNK_PROJECTS entry for "
+                                                      f"acme/job is followed by {',' + tail!r}, which is not an <id>=<dir> "
+                                                      "pair (a directory cannot contain a comma); running without punk"])
+                self.assertEqual(self.status()["status"], "failed")
         # a comma in another agent's entry does not stop this one
         os.unlink(self.log)
         r = self.run_agent(GATHERLANE_PUNK_PROJECTS=f"acme/other=/srv/one,two, acme/job={self.project}")
@@ -626,11 +712,15 @@ class PunkProjects(EnvCase):
         os.environ["GATHERLANE_PUNK_PROJECTS"] = ("broken, a/x = /srv/x ,b/y=~/gatherlane,=z,c/z=/1,c/z=/2,d/w=/w,d/w=/w,"
                                                   "e/v=/srv/a=b,f/u=/srv/one, two ,,g/t=/t,c/z=/1,")
         dirs, problems = gl.punk_projects()
-        self.assertEqual(dirs, {"a/x": "/srv/x", "b/y": os.path.expanduser("~/gatherlane"), "d/w": "/w", "e/v": "/srv/a=b",
-                                "g/t": "/t"})
-        self.assertEqual(sorted(problems), ["c/z", "f/u"])
+        self.assertEqual(dirs, {"a/x": "/srv/x", "d/w": "/w", "e/v": "/srv/a=b", "g/t": "/t"})
+        self.assertEqual(sorted(problems), ["b/y", "c/z", "f/u"])
+        self.assertIn("followed by ',=z'", problems["b/y"])  # no punk id before the `=`: the dir held a comma
         self.assertIn("listed twice", problems["c/z"])
         self.assertIn("followed by ',two'", problems["f/u"])
+        os.environ["GATHERLANE_PUNK_PROJECTS"] = "h/s=~/gatherlane, i/r=/srv/r,/opt/q=1,j/q=/q,_k=2,l/p=/p,x y=3"
+        dirs, problems = gl.punk_projects()
+        self.assertEqual(dirs, {"h/s": os.path.expanduser("~/gatherlane")})
+        self.assertEqual(sorted(problems), ["i/r", "j/q", "l/p"])  # each is followed by a pair with no punk id
 
 
 class PunkTimeout(EnvCase):
