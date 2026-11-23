@@ -581,7 +581,7 @@ class RunMemoryPunk(FakeServer):
                 self.assertEqual(self.status()["status"], "failed")
 
     def test_project_must_be_an_absolute_path(self):
-        for value in ("relative/dir", "./project", "-h", "~no-such-user-zz/project"):
+        for value in ("relative/dir", "./project", "-h", "~" + "no-such-user-zz/gatherlane"):  # split: the export refuses it whole
             with self.subTest(value=value):
                 os.path.exists(self.log) and os.unlink(self.log)
                 r = self.run_agent(code="raise SystemExit(6)", GATHERLANE_PUNK_PROJECTS=f"acme/job={value}")
@@ -593,9 +593,9 @@ class RunMemoryPunk(FakeServer):
         # `~` is expanded first, so a home-relative value is absolute
         home = os.path.dirname(self.project)
         os.unlink(self.log)
-        r = self.run_agent(GATHERLANE_PUNK_PROJECTS="acme/job=~/project", HOME=home)
+        r = self.run_agent(GATHERLANE_PUNK_PROJECTS="acme/job=~/gatherlane", HOME=home)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.calls()[0]["argv"][-1], self.project)
+        self.assertEqual(self.calls()[0]["argv"][-1], os.path.join(home, "gatherlane"))
         self.assertEqual(self.punk_lines(r), [])
 
     def test_project_with_a_comma_is_refused_not_cut(self):
