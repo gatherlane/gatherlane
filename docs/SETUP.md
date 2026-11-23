@@ -396,11 +396,13 @@ for an agent that is not paused. These settings in the env file go with it:
 ```sh
 export GATHERLANE_PUNK_PROJECTS=<operation>/<agent>=/srv/agents/<agent>   # comma separated <id>=<dir> pairs
 export GATHERLANE_PUNK_SKIP_ON_START_FAILURE=1                            # optional: skip the run when session start fails
-export GATHERLANE_PUNK_TIMEOUT=120                                        # optional: seconds per punk step, default 120
+export GATHERLANE_PUNK_TIMEOUT=120                                        # optional: seconds per punk step, default 120, at most 3600
 ```
 
-Each directory must be an absolute path. A step that runs past `GATHERLANE_PUNK_TIMEOUT` is
-stopped and counts as a `punk` failure.
+Each directory must be an absolute path, and project folders may not contain commas (a folder
+like `/srv/one,v2=x` would be read as two entries, see
+[Punk Records](../examples/punk-records.md)). A step that runs past `GATHERLANE_PUNK_TIMEOUT` is
+stopped and counts as a `punk` failure. A value above 3600 logs one line and uses 3600.
 
 A `punk` failure, a missing `punk` or a missing project entry is logged and never changes the exit
 code or the reported status. Without `--memory`, `run` behaves as above and reads none of these

@@ -147,9 +147,12 @@ runs. `punk` gets the same environment as the agent command, without `GATHERLANE
 standard input.
 
 Each step may take at most `GATHERLANE_PUNK_TIMEOUT` seconds, 120 unless the env file says
-otherwise (`export GATHERLANE_PUNK_TIMEOUT=300`). A value that is not a positive number logs
+otherwise (`export GATHERLANE_PUNK_TIMEOUT=300`), and at most 3600 (one hour). A value that is not
+a positive number logs
 `--memory punk: GATHERLANE_PUNK_TIMEOUT='<value>' is not a positive number of seconds; using 120`
-once, and `punk` runs with the default. `punk` runs in a process group of its own, so a step that runs out
+once, and `punk` runs with the default. A value above 3600 (`1e308` included) logs
+`--memory punk: GATHERLANE_PUNK_TIMEOUT='<value>' is more than 3600 seconds; using 3600` once,
+and each step gets 3600 seconds. `punk` runs in a process group of its own, so a step that runs out
 of time is stopped together with the `git` and `ssh` it started: `run` sends the group SIGTERM,
 so `git` can remove its lock files, and SIGKILL 5 seconds later. The step then counts as a failed
 step (as exit 1 would): `run` logs one line and goes on, `session end` still runs after a timed-out
@@ -163,7 +166,10 @@ Because `punk` has a process group of its own, a signal to the group of `run` (C
 while a step runs, `run` catches SIGINT, SIGTERM and SIGHUP, stops `punk` and its group the same
 way, and then ends by that signal, as it would without `--memory`: it reports nothing more, so the
 status file keeps `running` from the start of the run. A SIGHUP that is already ignored (`nohup`)
-stays ignored.
+stays ignored. Once `run` has started to stop `punk`, for a signal or for the time limit, a further
+SIGINT, SIGTERM or SIGHUP does not cut the 5 second grace short: `run` stops `punk` as above and
+then ends by the first signal it got (a Ctrl-C ends it with Python's usual `KeyboardInterrupt`
+message, as without `--memory`).
 
 A `punk` result never changes `run`'s exit code or the reported status. `run` adds at most one
 line per step to the log, each starting with `gatherlane:`, after `punk`'s own lines:
@@ -191,10 +197,13 @@ command runs as usual:
 | `--memory punk: no punk session for an id without a status file; ...` | the id has no status file yet, so `run` runs the command without reporting, as it always has, and without `punk` too: `run` does not check the pause flag for such an id, and a mistyped id would sign commits in the store with the wrong `Punk-Agent` |
 
 `GATHERLANE_PUNK_PROJECTS` entries are split at the first `=`; spaces around each part are
-ignored and a leading `~` is expanded. A directory cannot contain a comma. An agent id never
-contains `,` or `=`, so the setting cannot be read two ways. One case `run` cannot tell from two
-entries: a comma followed by text that is itself a valid pair (`a/x=/srv/one,v2=x` reads as `a/x`
-in `/srv/one` and `v2` in `x`), so keep commas out of the directory names.
+ignored and a leading `~` is expanded. **Project folders may not contain commas.** An agent id
+never contains `,` or `=`, so a setting without a comma in a folder cannot be read two ways. A
+comma in a folder is refused where `run` can see it (the table above), but not when the text after
+the comma is itself a valid pair: `a/x=/srv/one,v2=x` stays two entries, `a/x` in `/srv/one` and
+`v2` in `x`. The shortened folder (`/srv/one` here) may be a real, different project, and `punk`
+would then track that one for `a/x`. Rename a folder that holds a comma, or link it from a path
+without one.
 
 **Skipping the run when `session start` fails.** By default the agent runs even when
 `session start` exits 1 or 2, so an agent never stops working because of its memory. To skip the
