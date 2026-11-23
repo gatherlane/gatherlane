@@ -391,15 +391,20 @@ zone so the office shows times the way the agents report them.
 
 **Memory between runs (optional).** With [Punk Records](../examples/punk-records.md) installed,
 `run --memory punk` calls `punk session start` before the command and `punk session end` after it,
-for an agent that is not paused. Two settings in the env file go with it:
+for an agent that is not paused. These settings in the env file go with it:
 
 ```sh
 export GATHERLANE_PUNK_PROJECTS=<operation>/<agent>=/srv/agents/<agent>   # comma separated <id>=<dir> pairs
 export GATHERLANE_PUNK_SKIP_ON_START_FAILURE=1                            # optional: skip the run when session start fails
+export GATHERLANE_PUNK_TIMEOUT=120                                        # optional: seconds per punk step, default 120
 ```
 
+Each directory must be an absolute path. A step that runs past `GATHERLANE_PUNK_TIMEOUT` is
+stopped and counts as a `punk` failure.
+
 A `punk` failure, a missing `punk` or a missing project entry is logged and never changes the exit
-code or the reported status. Without `--memory`, `run` behaves as above and reads neither setting.
+code or the reported status. Without `--memory`, `run` behaves as above and reads none of these
+settings.
 
 **By runner:**
 
