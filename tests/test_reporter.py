@@ -325,9 +325,10 @@ class RunMemoryPunk(FakeServer):
         argv, extra = self.run_args(*args, **kw)
         return self.cli(*argv, extra=extra, input=input, timeout=timeout)
 
-    def run_and_signal(self, sig, when, ignore=None, **kw):
+    def run_and_signal(self, sig, when, ignore=None, again=None, **kw):
         """Start `run` as the leader of its own process group, wait until `when(calls)` holds, then signal that
-        group, the way GNU timeout, `kill -TERM -<pgid>` or a job supervisor does. Returns (returncode, stderr)."""
+        group, the way GNU timeout, `kill -TERM -<pgid>` or a job supervisor does, and once more `again` seconds
+        later if given. Returns (returncode, stderr)."""
         argv, extra = self.run_args(**kw)
         argv = [TOOL, *argv]
         if ignore:  # start `run` with `ignore` already ignored, as nohup does for SIGHUP
@@ -344,6 +345,9 @@ class RunMemoryPunk(FakeServer):
             self.assertLess(time.monotonic(), end, "run never reached the point to signal")
             time.sleep(.05)
         os.killpg(run.pid, sig)
+        if again:
+            time.sleep(again)
+            os.killpg(run.pid, sig)
         try:
             run.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -615,6 +619,19 @@ class RunMemoryPunk(FakeServer):
                 self.assertNotIn("punk session", err)  # a signal is not a punk failure to log
                 if sig != signal.SIGINT:
                     self.assertNotIn("Traceback", err)
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups")
+    def test_a_second_sigterm_does_not_cut_the_stop_short(self):
+        # punk ignores SIGTERM, so stopping it takes the grace and then SIGKILL; a second SIGTERM in that grace
+        # must not abandon the stop or end run with a traceback
+        hung = lambda calls: any("child" in c for c in calls)
+        rc, err = self.run_and_signal(signal.SIGTERM, hung, again=1, FAKE_PUNK_END="hang-ignore-term",
+                                      GATHERLANE_PUNK_TIMEOUT="60")
+        self.assertEqual(rc, -signal.SIGTERM, err)
+        self.assertNotIn("Traceback", err)
+        p = self.calls()[-1]
+        self.assertFalse(alive(p["pid"]), "punk outlived two SIGTERMs to run")
+        self.assertFalse(alive(p["child"]), "the child of punk outlived two SIGTERMs to run")
 
     @unittest.skipUnless(hasattr(os, "killpg"), "process groups")
     def test_an_ignored_sighup_stays_ignored(self):
